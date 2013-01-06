@@ -23,6 +23,9 @@ class FPM::Package::Python < FPM::Package
     "The path to the python executable you wish to run.", :default => "python"
   option "--easyinstall", "EASYINSTALL_EXECUTABLE",
     "The path to the easy_install executable tool", :default => "easy_install"
+  option "--pip", "PIP_EXECUTABLE",
+    "The path to the pip executable tool. If not specified, easy_install " \
+    "is used instead", :default => nil
   option "--pypi", "PYPI_URL",
     "PyPi Server uri for retrieving packages.",
     :default => "http://pypi.python.org/simple"
@@ -40,6 +43,11 @@ class FPM::Package::Python < FPM::Package
   option "--fix-dependencies", :flag, "Should the package dependencies be " \
     "prefixed?", :default => true
 
+  option "--downcase-name", :flag, "Should the target package name be in " \
+    "lowercase?", :default => true
+  option "--downcase-dependencies", :flag, "Should the package dependencies " \
+    "be in lowercase?", :default => true
+
   option "--install-bin", "BIN_PATH", "The path to where python scripts " \
     "should be installed to.", :default => "/usr/bin"
   option "--install-lib", "LIB_PATH", "The path to where python libs " \
@@ -47,6 +55,9 @@ class FPM::Package::Python < FPM::Package
     "Want to what your target platform is using? Run this: " \
     "python -c 'from distutils.sysconfig import get_python_lib; " \
     "print get_python_lib()'"
+  option "--install-data", "DATA_PATH", "The path to where data should be." \
+    "installed to. This is equivalent to 'python setup.py --install-data " \
+    "DATA_PATH"
 
   private
 
@@ -97,8 +108,17 @@ class FPM::Package::Python < FPM::Package
     target = build_path(package)
     FileUtils.mkdir(target) unless File.directory?(target)
 
-    safesystem(attributes[:python_easyinstall], "-i", attributes[:python_pypi],
-               "--editable", "-U", "--build-directory", target, want_pkg)
+    if attributes[:python_pip].nil?
+      # no pip, use easy_install
+      puts "EASY_INSTALL"
+      safesystem(attributes[:python_easyinstall], "-i",
+                 attributes[:python_pypi], "--editable", "-U",
+                 "--build-directory", target, want_pkg)
+    else
+      puts "PIP PIP CHEERIOS"
+      safesystem(attributes[:python_pip], "install", "--no-install",
+                 "-U", "--build", target, want_pkg)
+    end
 
     # easy_install will put stuff in @tmpdir/packagename/, so find that:
     #  @tmpdir/somepackage/setup.py
@@ -120,16 +140,25 @@ class FPM::Package::Python < FPM::Package
 
     # chdir to the directory holding setup.py because some python setup.py's assume that you are
     # in the same directory.
-    output = ::Dir.chdir(File.dirname(setup_py)) do
+    setup_dir = File.dirname(setup_py)
+
+    output = ::Dir.chdir(setup_dir) do
       setup_cmd = "env PYTHONPATH=#{pylib} #{attributes[:python_bin]} " \
         "setup.py --command-packages=pyfpm get_metadata"
       # Capture the output, which will be JSON metadata describing this python
       # package. See fpm/lib/fpm/package/pyfpm/get_metadata.py for more
       # details.
-      `#{setup_cmd}`
+      output = `#{setup_cmd}`
+      if !$?.success?
+        @logger.error("setup.py get_metadata failed", :command => setup_cmd,
+                      :exitcode => $?.exitcode)
+        raise "An unexpected error occurred while processing the setup.py file"
+      end
+      output
     end
-    @logger.warn("json output from setup.py", :data => output)
+    @logger.debug("full text from `setup.py get_metadata`", :data => output)
     metadata = JSON.parse(output[/\{.*\}/msx])
+    @logger.info("object output of get_metadata", :json => metadata)
 
     self.architecture = metadata["architecture"]
     self.description = metadata["description"]
@@ -145,12 +174,43 @@ class FPM::Package::Python < FPM::Package
       self.name = metadata["name"]
     end
 
+    # convert python-Foo to python-foo if flag is set
+    self.name = self.name.downcase if attributes[:python_downcase_name?]
+
+    requirements_txt = File.join(setup_dir, "requirements.txt")
+    if File.exists?(requirements_txt)
+      @logger.info("Found requirements.txt, using it instead of setup.py " \
+                    "for dependency information", :path => requirements_txt)
+      @logger.debug("Clearing dependency list (from setup.py) in prep for " \
+                    "reading requirements.txt")
+      # Best I can tell, requirements.txt are a superset of what
+      # is already supported as 'dependencies' in setup.py
+      # So we'll parse them the same way below.
+      
+      # requirements.txt can have dependencies, flags, and comments.
+      # We only want the comments, so remove comment and flag lines.
+      metadata["dependencies"] = File.read(requirements_txt).split("\n") \
+        .reject { |l| l =~ /^\s*$/ } \
+        .reject { |l| l =~ /^\s*#/ } \
+        .reject { |l| l =~ /^-/ } \
+        .map(&:strip)
+    end
+
     self.dependencies += metadata["dependencies"].collect do |dep|
-      name, cmp, version = dep.split
+      dep_re = /^([^<>!= ]+)\s*(?:([<>!=]{1,2})\s*(.*))?$/
+      match = dep_re.match(dep)
+      if match.nil?
+        @logger.error("Unable to parse dependency", :dependency => dep)
+        raise FPM::InvalidPackageConfiguration, "Invalid dependency '#{dep}'"
+      end
+      name, cmp, version = match.captures
       # dependency name prefixing is optional, if enabled, a name 'foo' will
       # become 'python-foo' (depending on what the python_package_name_prefix
       # is)
       name = fix_name(name) if attributes[:python_fix_dependencies?]
+
+      # convert dependencies from python-Foo to python-foo
+      name = name.downcase if attributes[:python_downcase_dependencies?]
       "#{name} #{cmp} #{version}"
     end
   end # def load_package_info
@@ -177,25 +237,20 @@ class FPM::Package::Python < FPM::Package
     prefix = "/"
     prefix = attributes[:prefix] unless attributes[:prefix].nil?
     
-    # Set the default install library location (like
-    # /usr/lib/python2.7/site-packages) if it is not given
-    if attributes[:python_install_lib].nil?
-      # Ask python where libraries are installed to.
-      # This line is unusually long because I don't have a shorter way to express it.
-      attributes[:python_install_lib] = %x{
-        #{attributes[:python_bin]} -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())'
-      }.chomp
-      @logger.info("Setting default :python_install_lib attribute",
-                   :value => attributes[:python_install_lib])
-    end
     # Some setup.py's assume $PWD == current directory of setup.py, so let's
     # chdir first.
     ::Dir.chdir(project_dir) do
-      safesystem(attributes[:python_bin], "setup.py", "install",
-                 "--root", staging_path, 
-                 "--install-lib", File.join(prefix, attributes[:python_install_lib]),
-                 "--install-data", File.join(prefix, attributes[:python_install_lib]),
-                 "--install-scripts", File.join(prefix, attributes[:python_install_bin]))
+      flags = [ "--root", staging_path ]
+      if !attributes[:python_install_lib].nil?
+        flags += [ "--install-lib", File.join(prefix, attributes[:python_install_lib]) ]
+      end
+      if !attributes[:python_install_data].nil?
+        flags += [ "--install-data", File.join(prefix, attributes[:python_install_data]) ]
+      end
+      if !attributes[:python_install_bin].nil?
+        flags += [ "--install-scripts", File.join(prefix, attributes[:python_install_bin]) ]
+      end
+      safesystem(attributes[:python_bin], "setup.py", "install", *flags)
     end
   end # def install_to_staging
 

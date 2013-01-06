@@ -66,6 +66,17 @@ class FPM::Package::RPM < FPM::Package
     value.downcase
   end
 
+  # TODO(sissel): Try to be smart about the default OS.
+  # issue #309
+  option "--os", "OS", "The operating system to target this rpm for. " \
+    "You want to set this to 'linux' if you are using fpm on OS X, for example"
+
+  option "--changelog", "FILEPATH", "Add changelog from FILEPATH contents" do |file|
+    File.read(File.expand_path(file))
+  end
+
+  option "--sign", :flag, "Pass --sign to rpmbuild"
+
   private
 
   # Handle any architecture naming conversions.
@@ -121,7 +132,29 @@ class FPM::Package::RPM < FPM::Package
           provides
         end
       end
+      self.dependencies = self.dependencies.collect do |dependency|
+        first, remainder = dependency.split("-", 2)
+        if first == "rubygem"
+          name, remainder = remainder.split(" ", 2)
+          "rubygem(#{name})#{remainder ? " #{remainder}" : ""}"
+        else
+          dependency
+        end
+      end
       #self.provides << "rubygem(#{self.name})"
+    end
+
+    # Convert != dependency as Conflict =, as rpm doesn't understand !=
+    if origin == FPM::Package::Python
+      self.dependencies = self.dependencies.select do |dep|
+        name, op, version = dep.split(/\s+/)
+        dep_ok = true
+        if op == '!='
+          self.conflicts << "#{name} = #{version}"
+          dep_ok = false
+        end
+        dep_ok
+      end
     end
   end # def converted
 
@@ -168,17 +201,39 @@ class FPM::Package::RPM < FPM::Package
     
     self.config_files += rpm.config_files
 
+    # rpms support '%dir' things for specifying empty directories to package,
+    # but the rpm header itself doesn't actually record this information.
+    # so there's no 'directories' to copy, so don't try to merge in the
+    # 'directories' feature. 
+    # TODO(sissel): If you want this feature, we'll have to find scan
+    # the extracted rpm for empty directories. I'll wait until someone asks for
+    # this feature
+    #self.directories += rpm.directories
+
     # Extract to the staging directory
     rpm.extract(staging_path)
   end # def input
 
   def output(output_path)
+    output_check(output_path)
+    raise FileAlreadyExists.new(output_path) if File.exists?(output_path)
     %w(BUILD RPMS SRPMS SOURCES SPECS).each { |d| FileUtils.mkdir_p(build_path(d)) }
-    args = ["rpmbuild", "-bb",
+    args = ["rpmbuild", "-bb"]
+
+    # issue #309
+    if !attributes[:rpm_os].nil?
+      rpm_target = "#{architecture}-unknown-#{attributes[:rpm_os]}"
+      args += ["--target", rpm_target]
+    end
+
+    args += [
       "--define", "buildroot #{build_path}/BUILD",
       "--define", "_topdir #{build_path}",
       "--define", "_sourcedir #{build_path}",
-      "--define", "_rpmdir #{build_path}/RPMS"]
+      "--define", "_rpmdir #{build_path}/RPMS",
+    ]
+
+    args += ["--sign"] if attributes[:rpm_sign?]
 
     (attributes[:rpm_rpmbuild_define] or []).each do |define|
       args += ["--define", define]
@@ -212,6 +267,11 @@ class FPM::Package::RPM < FPM::Package
     #return File.join("BUILD", prefix)
   end # def prefix
 
+  # The default epoch value must be 1 (backward compatibility for rpms built
+  # with fpm 0.4.3 and older)
+  def epoch
+    return @epoch || "1"
+  end # def epoch
 
   def to_s(format=nil)
     return super("NAME-VERSION-ITERATION.ARCH.TYPE") if format.nil?
@@ -227,5 +287,6 @@ class FPM::Package::RPM < FPM::Package
   end # def digest_algorithm
 
   public(:input, :output, :converted_from, :architecture, :to_s, :iteration,
-         :payload_compression, :digest_algorithm, :prefix, :build_sub_dir)
+         :payload_compression, :digest_algorithm, :prefix, :build_sub_dir,
+         :epoch)
 end # class FPM::Package::RPM

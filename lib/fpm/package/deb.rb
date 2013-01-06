@@ -66,6 +66,32 @@ class FPM::Package::Deb < FPM::Package
     value.to_i
   end
 
+  option "--priority", "PRIORITY", 
+    "The debian package 'priority' value.", :default => "extra"
+
+  option "--user", "USER", "The owner of files in this package"
+
+  option "--group", "GROUP", "The group owner of files in this package"
+
+  option "--changelog", "FILEPATH", "Add FILEPATH as debian changelog" do |file|
+    File.expand_path(file)
+  end
+
+  option "--recommends", "PACKAGE", "Add PACKAGE to Recommends" do |pkg|
+    @recommends ||= []
+    @recommends << pkg
+  end
+
+  option "--suggests", "PACKAGE", "Add PACKAGE to Suggests" do |pkg|
+    @suggests ||= []
+    @suggests << pkg
+  end
+
+  def initialize(*args)
+    super(*args)
+    attributes[:deb_priority] = "extra"
+  end # def initialize
+
   private
 
   # Return the architecture. This will default to native if not yet set.
@@ -77,7 +103,10 @@ class FPM::Package::Deb < FPM::Package
       # system about.
       if program_in_path?("dpkg")
         @architecture = %x{dpkg --print-architecture 2> /dev/null}.chomp
-        @architecture = %{uname -m}.chomp if $?.exitstatus != 0
+        if $?.exitstatus != 0 or @architecture.empty?
+          # if dpkg fails or emits nothing, revert back to uname -m
+          @architecture = %x{uname -m}.chomp 
+        end
       else
         @architecture = %x{uname -m}.chomp
       end
@@ -98,19 +127,24 @@ class FPM::Package::Deb < FPM::Package
       @logger.warn("Debian tools (dpkg/apt) don't do well with packages " \
         "that use capital letters in the name. In some cases it will " \
         "automatically downcase them, in others it will not. It is confusing." \
-        "Best to not use any capital letters at all.",
+        " Best to not use any capital letters at all. I have downcased the " \
+        "package name for you just to be safe.",
         :oldname => @name, :fixedname => @name.downcase)
       @name = @name.downcase
     end
 
     if @name.include?("_")
-      @logger.info("Package name includes underscores, converting to dashes",
-                   :name => @name)
+      @logger.info("Debian package names cannot include underscores; " \
+                   "automatically converting to dashes", :name => @name)
       @name = @name.gsub(/[_]/, "-")
     end
 
     return @name
   end # def name
+  
+  def prefix
+    return (attributes[:prefix] or "/")
+  end # def prefix
 
   def input(input_path)
     extract_info(input_path)
@@ -130,7 +164,8 @@ class FPM::Package::Deb < FPM::Package
         if value.nil?
           return nil
         else
-          value.split(": ",2).last
+          @logger.info("deb field", field => value.split(": ", 2).last)
+          return value.split(": ",2).last
         end
       end
       
@@ -149,6 +184,7 @@ class FPM::Package::Deb < FPM::Package
       self.name = parse.call("Package")
       self.url = parse.call("Homepage")
       self.vendor = parse.call("Vendor") || self.vendor
+      self.provides = parse.call("Provides") || self.provides
 
       # The description field is a special flower, parse it that way.
       # The description is the first line as a normal Description field, but also continues
@@ -197,7 +233,6 @@ class FPM::Package::Deb < FPM::Package
 
   def extract_files(package)
     # Find out the compression type
-    p `ar t #{package}`
     compression = `ar t #{package}`.split("\n").grep(/data.tar/).first.split(".").last
     case compression
       when "gz"
@@ -221,6 +256,7 @@ class FPM::Package::Deb < FPM::Package
   end # def extract_files
 
   def output(output_path)
+    output_check(output_path)
     # Abort if the target path already exists.
     raise FileAlreadyExists.new(output_path) if File.exists?(output_path)
 
@@ -244,7 +280,24 @@ class FPM::Package::Deb < FPM::Package
         raise FPM::InvalidPackageConfiguration,
           "Unknown compression type '#{self.attributes[:deb_compression]}'"
     end
-    safesystem(tar_cmd, "-C", staging_path, compression, "-cf", datatar, ".")
+    tar_flags = []
+    if !attributes[:deb_user].nil?
+      tar_flags += [ "--owner", attributes[:deb_user] ]
+    end
+    if !attributes[:deb_group].nil?
+      tar_flags += [ "--group", attributes[:deb_group] ]
+    end
+
+    if attributes[:deb_changelog]
+      dest_changelog = File.join(staging_path, "usr/share/doc/#{attributes[:name]}/changelog.Debian")
+      FileUtils.mkdir_p(File.dirname(dest_changelog))
+      FileUtils.cp attributes[:deb_changelog], dest_changelog
+      safesystem("gzip", dest_changelog)
+      File.chmod(0644, dest_changelog)
+    end
+
+    args = [ tar_cmd, "-C", staging_path, compression ] + tar_flags + [ "-cf", datatar, "." ]
+    safesystem(*args)
 
     # pack up the .deb, which is just an 'ar' archive with 3 files
     # the 'debian-binary' file has to be first
@@ -256,19 +309,17 @@ class FPM::Package::Deb < FPM::Package
     @logger.log("Created deb package", :path => output_path)
   end # def output
 
-  def default_output
-    if iteration
-      "#{name}_#{version}-#{iteration}_#{architecture}.#{type}"
-    else
-      "#{name}_#{version}_#{architecture}.#{type}"
-    end
-  end # def default_output
-
   def converted_from(origin)
     self.dependencies = self.dependencies.collect do |dep|
       fix_dependency(dep)
     end.flatten
   end # def converted_from
+
+  def debianize_op(op)
+    # Operators in debian packaging are <<, <=, =, >= and >>
+    # So any operator like < or > must be replaced
+    {:< => "<<", :> => ">>"}[op.to_sym] or op
+  end
 
   def fix_dependency(dep)
     # Deb dependencies are: NAME (OP VERSION), like "zsh (> 3.0)"
@@ -280,7 +331,7 @@ class FPM::Package::Deb < FPM::Package
       name, op, version = dep.split(/ +/)
       if !version.nil?
         # Convert strings 'foo >= bar' to 'foo (>= bar)'
-        dep = "#{name} (#{op} #{version})"
+        dep = "#{name} (#{debianize_op(op)} #{version})"
       end
     end
 
@@ -432,5 +483,5 @@ class FPM::Package::Deb < FPM::Package
     return super(format)
   end # def to_s
 
-  public(:input, :output, :architecture, :name, :converted_from, :to_s)
+  public(:input, :output, :architecture, :name, :prefix, :converted_from, :to_s)
 end # class FPM::Target::Deb
