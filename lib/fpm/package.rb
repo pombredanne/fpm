@@ -25,6 +25,14 @@ class FPM::Package
     end # def to_s
   end # class FileAlreadyExists
 
+  # This class is raised when you try to output a package to a path
+  # whose containing directory does not exist.
+  class ParentDirectoryMissing < StandardError
+    def to_s
+      return "Parent directory does not exist: #{File.dirname(super)} - cannot write to #{super}"
+    end # def to_s
+  end # class ParentDirectoryMissing
+
   # The name of this package
   attr_accessor :name
 
@@ -96,6 +104,8 @@ class FPM::Package
   # Array of configuration files
   attr_accessor :config_files
 
+  attr_accessor :directories
+
   # Any other attributes specific to this package.
   # This is where you'd put rpm, deb, or other specific attributes.
   attr_accessor :attributes
@@ -160,6 +170,7 @@ class FPM::Package
     @dependencies = []
     @scripts = {}
     @config_files = []
+    @directories = []
 
     staging_path
     build_path
@@ -186,7 +197,7 @@ class FPM::Package
       :@architecture, :@attributes, :@category, :@config_files, :@conflicts,
       :@dependencies, :@description, :@epoch, :@iteration, :@license, :@maintainer,
       :@name, :@provides, :@replaces, :@scripts, :@url, :@vendor, :@version,
-      :@config_files, :@staging_path
+      :@directories, :@staging_path
     ]
     ivars.each do |ivar|
       #@logger.debug("Copying ivar", :ivar => ivar, :value => instance_variable_get(ivar),
@@ -252,8 +263,8 @@ class FPM::Package
 
   # Clean up any temporary storage used by this class.
   def cleanup
-    cleanup_staging
-    cleanup_build
+    cleanup_staging unless @logger.level == :debug
+    cleanup_build unless @logger.level == :debug
   end # def cleanup
 
   def cleanup_staging
@@ -311,6 +322,7 @@ class FPM::Package
   end # def template
 
   def to_s(fmt="NAME.TYPE")
+    fmt = "NAME.TYPE" if fmt.nil?
     fullversion = version.to_s
     fullversion += "-#{iteration}" if iteration
     return fmt.gsub("ARCH", architecture.to_s) \
@@ -487,9 +499,23 @@ class FPM::Package
     end
   end # def script
 
+  def output_check(output_path)
+    if !File.directory?(File.dirname(output_path))
+      raise ParentDirectoryMissing.new(output_path)
+    end
+  end # def output_path
+
+  def provides=(value)
+    if !value.is_a?(Array)
+      @provides = [value]
+    else 
+      @provides = value
+    end
+  end
+
   # General public API
   public(:type, :initialize, :convert, :input, :output, :to_s, :cleanup, :files,
-         :version, :script)
+         :version, :script, :provides=)
 
   # Package internal public api
   public(:cleanup_staging, :cleanup_build, :staging_path, :converted_from,

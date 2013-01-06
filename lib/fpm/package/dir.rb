@@ -49,11 +49,13 @@ class FPM::Package::Dir < FPM::Package
   end # def input
 
   # Output this package to the given directory.
-  def output(dir)
-    dir = File.expand_path(dir)
+  def output(output_path)
+    output_check(output_path)
+
+    output_path = File.expand_path(output_path)
     ::Dir.chdir(staging_path) do
       @logger["method"] = "output"
-      clone(".", dir)
+      clone(".", output_path)
     end
   ensure
     @logger.remove("method")
@@ -110,7 +112,7 @@ class FPM::Package::Dir < FPM::Package
       begin
         @logger.debug("Linking", :source => source, :destination => destination)
         File.link(source, destination)
-      rescue Errno::EXDEV
+      rescue Errno::EXDEV, Errno::EPERM
         # Hardlink attempt failed, copy it instead
         @logger.debug("Copying", :source => source, :destination => destination)
         FileUtils.copy_entry(source, destination)

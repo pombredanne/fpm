@@ -39,8 +39,8 @@ describe FPM::Package::RPM do
   end
 
   describe "#epoch" do
-    it "should default to nil" do
-      insist { subject.epoch }.nil?
+    it "should default to 1" do
+      insist { subject.epoch } == "1"
     end
   end
   
@@ -60,6 +60,8 @@ describe FPM::Package::RPM do
   describe "#templating" do
     context "default user and group" do
       before :all do
+        FileUtils.mkdir_p(subject.staging_path(File.dirname(__FILE__)))
+        FileUtils.cp(__FILE__, subject.staging_path(__FILE__))
 
         # set the list of files for this RPM
         def subject.files; [__FILE__]; end
@@ -82,6 +84,9 @@ describe FPM::Package::RPM do
         subject.attributes[:rpm_user] = "some_user"
         subject.attributes[:rpm_group] = "some_group"
 
+        FileUtils.mkdir_p(subject.staging_path(File.dirname(__FILE__)))
+        FileUtils.cp(__FILE__, subject.staging_path(__FILE__))
+
         # set the list of files for this RPM
         def subject.files; [__FILE__]; end
         def subject.rpmspec; @rpmspec; end
@@ -102,7 +107,8 @@ describe FPM::Package::RPM do
   describe "#output", :if => program_in_path?("rpmbuild") do
     context "package attributes" do
       before :all do
-        @target = Tempfile.new("fpm-test-rpm")
+        @target = Tempfile.new("fpm-test-rpm").path
+        File.delete(@target)
         subject.name = "name"
         subject.version = "123"
         subject.architecture = "all"
@@ -111,6 +117,10 @@ describe FPM::Package::RPM do
         subject.dependencies << "something > 10"
         subject.dependencies << "hello >= 20"
         subject.conflicts << "bad < 2"
+        subject.attributes[:rpm_os] = "fancypants"
+
+        # Make sure multi-line licenses are hacked to work in rpm (#252)
+        subject.license = "this\nis\nan\example"
         subject.provides << "bacon = 1.0"
 
         # TODO(sissel): This api sucks, yo.
@@ -120,25 +130,28 @@ describe FPM::Package::RPM do
         subject.scripts[:after_remove] = "example after_remove"
 
         # Write the rpm out
-        subject.output(@target.path)
+        subject.output(@target)
 
         # Read the rpm
-        @rpm = ::RPM::File.new(@target.path)
+        @rpm = ::RPM::File.new(@target)
 
         @rpmtags = {}
         @rpm.header.tags.each do |tag|
           @rpmtags[tag.tag] = tag.value
         end
-      end
+      end # before :all
 
       after :all do
         subject.cleanup
-        @target.close
-        @target.delete
-      end # after
+        File.delete(@target)
+      end # after :all
 
       it "should have the correct name" do
         insist { @rpmtags[:name] } == subject.name
+      end
+
+      it "should obey the os attribute" do
+        insist { @rpmtags[:os] } == subject.attributes[:rpm_os]
       end
 
       it "should have the correct version" do
@@ -183,6 +196,10 @@ describe FPM::Package::RPM do
         end
       end
 
+      it "should replace newlines with spaces in the license field (issue#252)" do
+        insist { @rpm.tags[:license] } == subject.license.split("\n").join(" ")
+      end
+
       it "should have the correct 'preun' script" do
         insist { @rpm.tags[:preun] } == "example before_remove"
         insist { @rpm.tags[:preunprog] } == "/bin/sh"
@@ -218,48 +235,137 @@ describe FPM::Package::RPM do
       end
     end # package attributes
 
-    describe "regressions should not occur" do
-      before :each do
-        @target = Tempfile.new("fpm-test-rpm")
+    context "package default attributes" do
+      before :all do
+        @target = Tempfile.new("fpm-test-rpm").path
+        File.delete(@target)
         subject.name = "name"
         subject.version = "123"
-        subject.iteration = "100"
-        subject.epoch = "5"
-      end
+        # Write the rpm out
+        subject.output(@target)
 
-      after :each do
+        # Read the rpm
+        @rpm = ::RPM::File.new(@target)
+
+        @rpmtags = {}
+        @rpm.header.tags.each do |tag|
+          @rpmtags[tag.tag] = tag.value
+        end
+      end # before :all
+
+      after :all do
         subject.cleanup
-        @target.close
-        @target.delete
-      end # after
+        File.delete(@target)
+      end # after :all
 
-      it "should permit spaces in filenames (issue #164)" do
-        File.write(subject.staging_path("file with space"), "Hello")
-
-        # This will raise an exception if rpmbuild fails.
-        subject.output(@target.path)
+      it "should have the correct name" do
+        insist { @rpmtags[:name] } == subject.name
       end
 
-      it "should permit brackets in filenames (issue #202)" do
-        File.write(subject.staging_path("file[with]bracket"), "Hello")
+      # I don't know the 'os' values for any other OS.
+      it "should have a default OS value" do
+        os = `uname -s`.chomp.downcase
 
-        # This will raise an exception if rpmbuild fails.
-        subject.output(@target.path)
+        # The 'os' tag will be set to \x01 if the package 'target'
+        # was set incorrectly.
+        reject { @rpmtags[:os] } == "\x01"
+
+        insist { @rpmtags[:os] } == os
+        insist { `rpm -q --qf '%{OS}' -p #{@target}`.chomp } == os
       end
 
-      it "should permit asterisks in filenames (issue #202)" do
-        File.write(subject.staging_path("file*asterisk"), "Hello")
-
-        # This will raise an exception if rpmbuild fails.
-        subject.output(@target.path)
+      it "should have the correct version" do
+        insist { @rpmtags[:version] } == subject.version
       end
-    end # regression stuff
+
+      it "should have the default iteration" do
+        insist { @rpmtags[:release].to_s } == "1"
+      end
+
+      #it "should have the correct epoch" do
+        #insist { @rpmtags[:epoch].first.to_s } == ""
+      #end
+
+      it "should output a package with the no conflicts" do
+        # @rpm.requires is an array of [name, op, requires] elements
+        # fpm uses strings here, so convert.
+        conflicts = @rpm.conflicts.collect { |a| a.join(" ") }
+
+        subject.conflicts.each do |dep|
+          insist { conflicts }.include?(dep)
+        end
+      end
+
+      it "should output a package with no provides" do
+        # @rpm.requires is an array of [name, op, requires] elements
+        # fpm uses strings here, so convert.
+        provides = @rpm.provides.collect { |a| a.join(" ") }
+
+        subject.provides.each do |dep|
+          insist { provides }.include?(dep)
+        end
+      end
+    end # package attributes
   end # #output
+
+  describe "regressions should not occur", :if => program_in_path?("rpmbuild") do
+    before :each do
+      @target = Tempfile.new("fpm-test-rpm").path
+      File.delete(@target)
+      subject.name = "name"
+      subject.version = "1.23"
+    end
+
+    after :each do
+      subject.cleanup
+      File.delete(@target)
+    end # after
+
+    it "should permit spaces in filenames (issue #164)" do
+      File.write(subject.staging_path("file with space"), "Hello")
+
+      # This will raise an exception if rpmbuild fails.
+      subject.output(@target)
+    end
+
+    it "should permit brackets in filenames (issue #202)" do
+      File.write(subject.staging_path("file[with]bracket"), "Hello")
+
+      # This will raise an exception if rpmbuild fails.
+      subject.output(@target)
+    end
+
+    it "should permit asterisks in filenames (issue #202)" do
+      File.write(subject.staging_path("file*asterisk"), "Hello")
+
+      # This will raise an exception if rpmbuild fails.
+      subject.output(@target)
+    end
+
+    it "should have some reasonable defaults that never change" do
+      subject.output(@target)
+      # Read the rpm
+      rpm = ::RPM::File.new(@target)
+
+      rpmtags = {}
+      rpm.header.tags.each do |tag|
+        rpmtags[tag.tag] = tag.value
+      end
+
+      # Default epoch must be '1'
+      # For some reason, epoch is an array of numbers in rpm?
+      insist { rpmtags[:epoch] } == [1]
+
+      # Default release must be '1'
+      insist { rpmtags[:release] } == "1"
+    end
+  end # regression stuff
 
   describe "#output with digest and compression settings", :if => program_in_path?("rpmbuild") do
     context "bzip2/sha1" do
       before :all do
-        @target = Tempfile.new("fpm-test-rpm")
+        @target = Tempfile.new("fpm-test-rpm").path
+        File.delete(@target)
         subject.name = "name"
         subject.version = "123"
         subject.architecture = "all"
@@ -269,10 +375,10 @@ describe FPM::Package::RPM do
         subject.attributes[:rpm_digest] = "sha1"
 
         # Write the rpm out
-        subject.output(@target.path)
+        subject.output(@target)
 
         # Read the rpm
-        @rpm = ::RPM::File.new(@target.path)
+        @rpm = ::RPM::File.new(@target)
 
         @rpmtags = {}
         @rpm.header.tags.each do |tag|
@@ -282,8 +388,7 @@ describe FPM::Package::RPM do
 
       after :all do
         subject.cleanup
-        @target.close
-        @target.delete
+        File.delete(@target)
       end # after
 
       it "should have the compressor and digest algorithm listed" do

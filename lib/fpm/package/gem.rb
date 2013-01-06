@@ -51,12 +51,7 @@ class FPM::Package::Gem < FPM::Package
   def download_if_necessary(gem, gem_version)
     path = gem
     if !File.exists?(path)
-      looks_like_name_re = /^[A-Za-z0-9_-]+$/
-      if path =~ looks_like_name_re
-        path = download(gem, gem_version)
-      else
-        raise FPM::Package::InvalidArgument.new("Gem '#{gem}' doesn't appear to be a valid rubygem file or name?")
-      end
+      path = download(gem, gem_version)
     end
 
     @logger.info("Using gem file", :path => path)
@@ -112,7 +107,13 @@ class FPM::Package::Gem < FPM::Package
 
       #self.name = [attributes[:gem_package_name_prefix], spec.name].join("-")
       self.license = (spec.license or "no license listed in #{File.basename(file)}")
-      self.version = spec.version.to_s
+
+      # expand spec's version to match RationalVersioningPolicy to prevent cases
+      # where missing 'build' number prevents correct dependency resolution by target
+      # package manager. Ie. for dpkg 1.1 != 1.1.0
+      m = spec.version.to_s.scan(/(\d+)\.?/)
+      self.version = m.flatten.fill('0', m.length..2).join('.') 
+
       self.vendor = spec.author
       self.url = spec.homepage
       self.category = "Languages/Development/Ruby"
@@ -136,7 +137,7 @@ class FPM::Package::Gem < FPM::Package
 
       # By default, we'll usually automatically provide this, but in the case that we are
       # composing multiple packages, it's best to explicitly include it in the provides list.
-      self.provides << "#{self.name}"
+      self.provides << "#{self.name} = #{self.version}"
 
       spec.runtime_dependencies.map do |dep|
         # rubygems 1.3.5 doesn't have 'Gem::Dependency#requirement'

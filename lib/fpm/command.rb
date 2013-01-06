@@ -1,9 +1,11 @@
 require "rubygems"
 require "fpm/namespace"
+require "fpm/version"
 require "fpm/util"
 require "clamp"
 require "ostruct"
 require "fpm"
+require "tmpdir" # for Dir.tmpdir
 
 if $DEBUG
   Cabin::Channel.get(Kernel).subscribe($stdout)
@@ -12,13 +14,32 @@ end
 
 Dir[File.join(File.dirname(__FILE__), "package", "*.rb")].each do |plugin|
   Cabin::Channel.get(Kernel).info("Loading plugin", :path => plugin)
-  require plugin
+
+  require "fpm/package/#{File.basename(plugin)}"
 end
 
 
 # The main fpm command entry point.
 class FPM::Command < Clamp::Command
   include FPM::Util
+
+  def help(*args)
+    return [
+      "Intro:",
+      "",
+      "  This is fpm version #{FPM::VERSION}",
+      "",
+      "  If you think something is wrong, it's probably a bug! :)",
+      "  Please file these here: https://github.com/jordansissel/fpm/issues",
+      "",
+      "  You can find support on irc (#fpm on freenode irc) or via email with",
+      "  fpm-users@googlegroups.com",
+      "",
+
+      # Lastly, include the default help output via Clamp.
+      super
+    ].join("\n")
+  end # def help
 
   option "-t", "OUTPUT_TYPE",
     "the type of package you want to create (deb, rpm, solaris, etc)",
@@ -60,6 +81,10 @@ class FPM::Command < Clamp::Command
     @dependencies ||= []
     @dependencies << val
   end # -d / --depends
+
+  option "--no-depends", :flag, "Do not list any dependencies in this package",
+    :default => false
+
   option "--provides", "PROVIDES",
     "What this package provides (usually a name). This flag can be "\
     "specified multiple times." do |val|
@@ -80,13 +105,19 @@ class FPM::Command < Clamp::Command
   end # --replaces
   option "--config-files", "CONFIG_FILES",
     "Mark a file in the package as being a config file. This uses 'conffiles'" \
-    " in debs and %config in rpm. You can specify a directory to have it " \
-    "scanned marking all files found as config files. If you have multiple " \
-    "files to mark as configuration files, specify this flag multiple times." \
-    do |val|
+    " in debs and %config in rpm. If you have multiple files to mark as " \
+    "configuration files, specify this flag multiple times." do |val|
+    #You can specify a directory to have it scanned marking all files found as
+    #config files. If you have multiple "
     @config_files ||= []
     @config_files << val
   end # --config-files
+  option "--directories", "DIRECTORIES",
+    "Mark a directory as being owned by the package" \
+    do |val|
+    @directories ||= []
+    @directories << val
+  end # directories
   option ["-a", "--architecture"], "ARCHITECTURE",
     "The architecture name. Usually matches 'uname -m'. For automatic values," \
     " you can use '-a all' or '-a native'. These two strings will be " \
@@ -105,8 +136,12 @@ class FPM::Command < Clamp::Command
     @excludes ||= []
     @excludes << val
   end # -x / --exclude
-  option "--description", "DESCRIPTION", "Add a description for this package.",
-    :default => "no description"
+  option "--description", "DESCRIPTION", "Add a description for this package." \
+    " You can include '\n' sequences to indicate newline breaks.",
+    :default => "no description" do |val|
+    # Replace literal "\n" sequences with a newline character.
+    val.gsub("\\n", "\n")
+  end
   option "--url", "URI", "Add a url for this package.",
     :default => "http://example.com/no-uri-given"
   option "--inputs", "INPUTS_PATH",
@@ -157,6 +192,19 @@ class FPM::Command < Clamp::Command
     "see the fpm wiki: " \
     "https://github.com/jordansissel/fpm/wiki/Script-Templates"
 
+  option "--template-value", "KEY=VALUE",
+    "Make 'key' available in script templates, so <%= key %> given will be " \
+    "the provided value. Implies --template-scripts" do |kv|
+    @template_scripts = true
+    @template_values ||= []
+    @template_values << kv.split("=", 2)
+  end
+
+  option "--workdir", "WORKDIR",
+    "The directory you want fpm to do its work in, where 'work' is any file" \
+    "copying, downloading, etc. Roughly any scratch space fpm needs to build" \
+    "your package.", :default => Dir.tmpdir
+
   parameter "[ARGS] ...",
     "Inputs to the source package type. For the 'dir' type, this is the files" \
     " and directories you want to include in the package. For others, like " \
@@ -185,6 +233,7 @@ class FPM::Command < Clamp::Command
     @provides = []
     @dependencies = []
     @config_files = []
+    @directories = []
     @excludes = []
   end # def initialize
 
@@ -207,6 +256,9 @@ class FPM::Command < Clamp::Command
       @logger.info("No args, but -s dir and -C are given, assuming '.' as input") 
       args << "."
     end
+
+    @logger.info("Setting workdir", :workdir => workdir)
+    ENV["TMP"] = workdir
 
     validator = Validator.new(self)
     if !validator.ok?
@@ -274,7 +326,7 @@ class FPM::Command < Clamp::Command
       # Read each line as a path
       File.new(inputs, "r").each_line do |line| 
         # Handle each line as if it were an argument
-        input.input(line)
+        input.input(line.strip)
       end
     end
 
@@ -310,6 +362,7 @@ class FPM::Command < Clamp::Command
     input.provides += provides
     input.replaces += replaces
     input.config_files += config_files
+    input.directories += directories
     
     setscript = proc do |scriptname|
       # 'self.send(scriptname) == self.before_install == --before-install
@@ -342,11 +395,21 @@ class FPM::Command < Clamp::Command
     # Convert to the output type
     output = input.convert(output_class)
 
+    # Provide any template values as methods on the package.
+    if !@template_values.nil?
+      @template_values.each do |key, value|
+        (class << output; self; end).send(:define_method, key) { value }
+      end
+    end
+
     # Write the output somewhere, package can be nil if no --package is specified, 
     # and that's OK.
     begin
       output.output(output.to_s(package))
     rescue FPM::Package::FileAlreadyExists => e
+      @logger.fatal(e.message)
+      return 1
+    rescue FPM::Package::ParentDirectoryMissing => e
       @logger.fatal(e.message)
       return 1
     end
@@ -357,6 +420,9 @@ class FPM::Command < Clamp::Command
     return 1
   rescue FPM::InvalidPackageConfiguration => e
     @logger.error("Invalid package configuration: #{e}")
+    return 1
+  rescue FPM::Package::InvalidArgument => e
+    @logger.error("Invalid package argument: #{e}")
     return 1
   ensure
     input.cleanup unless input.nil?
@@ -406,7 +472,23 @@ class FPM::Command < Clamp::Command
                   "Expected one of: #{types.join(", ")}")
       end
 
-      mandatory(@command.args.any?,
+      with (@command.dependencies) do |dependencies|
+        # Verify dependencies don't include commas (#257)
+        dependencies.each do |dep|
+          next unless dep.include?(",")
+          splitdeps = dep.split(/\s*,\s*/)
+          @messages << "Dependencies should not " \
+            "include commas. If you want to specify multiple dependencies, use " \
+            "the '-d' flag multiple times. Example: " + \
+            splitdeps.map { |d| "-d '#{d}'" }.join(" ")
+        end
+      end
+
+      if @command.inputs
+        mandatory(@command.input_type == "dir", "--inputs is only valid with -s dir")
+      end
+
+      mandatory(@command.args.any? || @command.inputs,
                 "No parameters given. You need to pass additional command " \
                 "arguments so that I know what you want to build packages " \
                 "from. For example, for '-s dir' you would pass a list of " \

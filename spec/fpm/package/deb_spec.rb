@@ -9,7 +9,7 @@ describe FPM::Package::Deb do
   have_dpkg_deb = program_in_path?("dpkg-deb")
   if !have_dpkg_deb
     Cabin::Channel.get("rspec") \
-      .warn("Skipping Deb#output tests because 'dpkg-deb' isn't in your PATH")
+      .warn("Skipping some deb tests because 'dpkg-deb' isn't in your PATH")
   end
 
   after :each do
@@ -23,9 +23,13 @@ describe FPM::Package::Deb do
     end
 
     it "should default to native" do
+      expected = ""
       if program_in_path?("dpkg")
         expected = %x{dpkg --print-architecture}.chomp
-      else
+      end
+
+      if expected.empty?
+        # dpkg was missing, failed, or emitted nothing.
         expected = %x{uname -m}.chomp
       end
 
@@ -44,6 +48,12 @@ describe FPM::Package::Deb do
   describe "#epoch" do
     it "should default to nil" do
       insist { subject.epoch }.nil?
+    end
+  end
+
+  describe "priority" do
+    it "should default to 'extra'" do
+      insist { subject.attributes[:deb_priority] } == "extra"
     end
   end
 
@@ -106,6 +116,9 @@ describe FPM::Package::Deb do
       @original.architecture = "all"
       @original.dependencies << "something > 10"
       @original.dependencies << "hello >= 20"
+      @original.provides = "#{@original.name} = #{@original.version}"
+
+      @original.attributes[:deb_priority] = "fizzle"
       @original.output(@target)
 
       @input = FPM::Package::Deb.new
@@ -139,6 +152,11 @@ describe FPM::Package::Deb do
           insist { @input.dependencies }.include?(dep)
         end
       end
+
+      it "should ignore versions and conditions in 'provides' (#280)" do
+        # Provides is an array because rpm supports multiple 'provides'
+        insist { @input.provides } == [ @original.name ]
+      end
     end # package attributes
 
     # This section mainly just verifies that 'dpkg-deb' can parse the package.
@@ -154,6 +172,50 @@ describe FPM::Package::Deb do
       it "should have the correct 'epoch:version-iteration'" do
         insist { dpkg_field("Version") } == @original.to_s("EPOCH:VERSION-ITERATION")
       end
+
+      it "should have the correct priority" do
+        insist { dpkg_field("Priority") } == @original.attributes[:deb_priority]
+      end
+
+      it "should have the correct dependency list" do
+        # 'something > 10' should convert to 'something (>> 10)', etc.
+        insist { dpkg_field("Depends") } == "something (>> 10), hello (>= 20)"
+      end
     end
   end # #output
+
+  describe "#output with no depends" do 
+    before :all do
+      # output a package, use it as the input, set the subject to that input
+      # package. This helps ensure that we can write and read packages
+      # properly.
+      tmpfile = Tempfile.new("fpm-test-deb")
+      @target = tmpfile.path
+      # The target file must not exist.
+      tmpfile.unlink
+
+      @original = FPM::Package::Deb.new
+      @original.name = "name"
+      @original.version = "123"
+      @original.iteration = "100"
+      @original.epoch = "5"
+      @original.architecture = "all"
+      @original.dependencies << "something > 10"
+      @original.dependencies << "hello >= 20"
+      @original.attributes[:no_depends?] = true
+      @original.output(@target)
+
+      @input = FPM::Package::Deb.new
+      @input.input(@target)
+    end
+
+    after :all do
+      @original.cleanup
+      @input.cleanup
+    end # after
+
+    it "should have no dependencies" do
+      insist { @input.dependencies }.empty?
+    end
+  end # #output with no dependencies
 end # describe FPM::Package::Deb
