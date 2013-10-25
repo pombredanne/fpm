@@ -1,3 +1,154 @@
+?.?.? (???)
+  - cpan: catch more cases of perllocal.pod and delete them (#510)
+  - python: safer gathering of python module dependencies.
+
+0.4.42 (July 23, 2013)
+  - dir: make source=destination mappings behave the same way 'rsync -a' does
+    with respect to source and destination paths.
+
+0.4.41 (July 17, 2013)
+  - cpan: handle cases where modules don't specify a license
+  - deb: support multiple init scripts (#487, patch by Kristian Glass)
+
+0.4.40 (July 12, 2013)
+  - dir: supports mapping one path to another.
+    You set mappings by using 'source=destination' syntax. For example:
+    % fpm -s dir -t deb -n example /home/jls/.zshrc=/etc/skel/
+    The key above is the '=' symbol. The result of the above will be a package
+    containing only /etc/skel/.zshrc
+    For more, see https://github.com/jordansissel/fpm/wiki/Source:-dir#mapping
+  - python: the default scripts location is now chosen by python itself. The
+    previous default was "/usr/bin" and was not a good default. (#480)
+  - rpm: config files should have attributes (#484, patch by adamcstephens)
+  - python: correctly log the python setup.py exit code (#481, patch by Derek
+    Ludwig)
+
+0.4.39 (June 27, 2013)
+  - cpan: support more complex dependency specifications (reported by Mabi
+    Knittel)
+  
+0.4.38 (June 24, 2013)
+  - cpan: fpm's cpan code now works under ruby 1.8.7
+  - python: fix a bug in dependency handling (#461, Pranay Kanwar)
+  - pear: Added --pear-data-dir flag (#465, Zsolt Takács)
+  - cpan: fix a bug with some clean up on certain 64bit systems
+  - gem: improve detection of the gem bin install path (#476, Tray Torrance)
+  - rpm: fix bug when calling using --rpm-use-file-permissions 
+    (#464, Rich Horwood)
+
+0.4.37 (May 30, 2013)
+  - deb: fix creation failures on OS X (#450, patch by Anthony Scalisi and
+    Matthew M. Boedicker)
+  - deb: you can now set --deb-build-depends. This is generally for extremely
+    rare use cases. (#451, patch by torrancew)
+  - perl: add --cpan-perl-lib-path for a custom perl library installation path
+    (#447, patch by Brett Gailey)
+
+0.4.36 (May 15, 2013)
+  - pear: only do channel-discover if necessary (#438, patch by Hatt)
+  - cpan: now supports cpan modules that use Module::Build
+  - cpan: --no-cpan-test now skips tests for build/configure dependencies
+  - rpm: Add --rpm-defattrfile and --rpm-defattrdir flags (#428, patch 
+    by phrawzty)
+
+0.4.35 -- was not announced 
+
+0.4.34 (May 7, 2013)
+  - Now supports CPAN - Perl mongers rejoice! For example:
+    'fpm -s cpan -t deb DBI'
+  - deb: fixed some additional complaints by lintian (#420, patch by Pranay
+    Kanwar)
+  - rpm: add flags --rpm-autoreqprov, --rpm-autoreq, and --rpm-autoprov
+    to tell rpm to enable that feature in the rpm spec. (#416, patch by Adam
+    Stephens)
+
+0.4.33 (April 9, 2013)
+  - Now supports npm, the node package manager. For example: 
+    'fpm -s npm -t deb express'
+
+0.4.32 (April 9, 2013)
+  - COMPATIBILITY WARNING: rpm: The default epoch is now nothing because this
+    aligns more closely with typical rpm packages in the real world. This
+    decision was reached in #381. If you need the previous behavior, you
+    must now specify '--epoch 1' (#388, patch by Pranay Kanwar)
+  - python: new flag --python-obey-requirements-txt which makes a
+    requirements.txt file from the python package used for the package
+    dependencies instead of the usual setup.py dependencies. The default
+    behavior without this flag is to respect setup.py. (#384)
+  - deb: new flag --deb-shlibs to specify the content of the 'shlibs' file
+    in the debian package (#405, patch by Aman Gupta)
+  - deb: fixed a few lintian errors (empty conffiles, md5sums on symlinks, etc)
+  - Add '-f' / '--force' flag to force overwriting an existing package output
+    path (#385, Timothy Sutton)
+  - New flag: --no-auto-depends flag to skip any automatic dependencies
+    that would normally be added by gem, python, deb, and rpms input packages.
+    (#386, #374; patch by Pranay Kanwar)
+  - gem: Use 'gem' command to download gems and read gem package information.
+    (#389, #394, #378, #233; patches by Pranay Kanwar and Chris Roberts)
+  - rpm: dashes are now replaced with underscores in rpm version strings
+    (#395, #393, #399;  patches by Jeff Terrace and Richard Guest)
+  - python: Only use the first line of a license; some python packages (like
+    'requests') embed their full license copy into the license field. For
+    the sake of sanity and function with most packaging systems, fpm only
+    uses the first line of that license.
+  - rpm: Add new 'none' option to --rpm-compression to disable compression
+    entirely. (#398, patch by Richard Guest)
+  - deb: Make dependencies using the '!=' operator represented as "Breaks"
+    in the deb package (previously used "Conflicts"). (#400)
+  - deb: Add md5sums to the debian packages which improves correctness
+    of the package. (#403, #401; patch by Pranay Kanwar)
+  - rpm: Convert all '!=' dependency operators to 'Conflicts'. Previously,
+    this only applied to packages converting from python to rpm. 
+    (#404, #396; patch by Pranay Kanwar)
+
+0.4.31 (March 21, 2013)
+  - rpm: new flag --rpm-use-file-permissions which try to create an rpm
+    that has file ownership/modes that exactly mirror how they are on 
+    the filesystem at package time. (#377, patch by Paul Rhodes)
+  - general: remove empty directories only when they match the exclude 
+    pattern (#323, patch by Pranay Kanwar)
+
+0.4.30 (March 21, 2013)
+  - Solaris: --solaris-user and --solaris-group flags to specify
+    the owner of files in a package. (#342, patch by Derek Olsen)
+  - rpm: (bug fix) epoch of 0 is permitted now (#343, patch by Ben Hughes)
+  - pear: add flags --pear-bin-dir --pear-php-bin --pear-php-dir (#358, patch
+    by Zsolt Takács)
+  - New 'source' type: empty. Allows you to create packages without any files
+    in them (sometimes called 'meta packages'). Useful when you want to have
+    one package be simply dependencies or when you want to spoof a package
+    you don't want installed, etc. (#359, 349; patch by Pranay Kanwar)
+  - solaris: Add --solaris-user and --solaris-group flags (#342, Patch by Derek
+    Olsen)
+  - gem: new flag --env-shebang; default true (disable with --no-env-shebang).
+    Lets you disable #! (shebang) mangling done by gem installation. (#363,
+    patch by Grier Johnson)
+  - deb: fix bug on changelog handling (#376, patch by mbakke)
+  - rpm: fix --rpm-rpmbuild-define (#383, patch by Eric Merritt)
+
+0.4.29 (January 22, 2013)
+  - Copy links literally, not what they point at (#337, patch by Dane Knecht)
+
+0.4.28 (January 21, 2013)
+  - Fix a dependency on the 'cabin' gem. (#344, reported by Jay Buffington)
+
+0.4.27 (January 16, 2013)
+  - Make all fpm output go through the logger (#329; patch by jaybuff)
+  - New package type: osxpkg, for building packages installable on OS X. (#332,
+    patch by Timothy Sutton)
+  - Fix crash bug when converting rpms to something else (#316, #325; patch by
+    rtucker-mozilla)
+  - deb: Add --deb-field for setting a custom field in the control file.
+    For more information on this setting, see section 5.7 "User-defined fields"
+    of the debian policy manual: 
+    http://www.debian.org/doc/debian-policy/ch-controlfields.html#s5.7
+  - deb: Add --deb-recommends and --deb-suggests (#285, #310; patch by Pranay
+    Kanwar)
+  - python to rpm: convert "!=" dependency operators in python to "Conflicts"
+    in rpm. (#263, #312; patch by Pranay Kanwar)
+  - python: fix bug - ignore blank lines in requirements.txt (#312, patch by
+    Pranay Kanwar)
+
 0.4.26 (December 27, 2012)
   - rpm: add --rpm-sign flag to sign packages using the 'rpmbuild --sign' flag.
     (#311, Patch by Pranay Kanwar)

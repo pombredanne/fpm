@@ -1,7 +1,19 @@
 require "fpm/namespace"
+require "childprocess"
+require "ffi"
 
 # Some utility functions
 module FPM::Util
+  extend FFI::Library
+  ffi_lib FFI::Library::LIBC
+
+  # mknod is __xmknod in glibc
+  begin
+    attach_function :mknod, :mknod, [:string, :uint32, :ulong], :int
+  rescue FFI::NotFoundError
+    attach_function :mknod, :__xmknod, [:string, :uint32, :ulong], :int
+  end
+
   # Raised if safesystem cannot find the program to run.
   class ExecutableNotFound < StandardError; end
 
@@ -18,6 +30,11 @@ module FPM::Util
 
   # Run a command safely in a way that gets reports useful errors.
   def safesystem(*args)
+    # ChildProcess isn't smart enough to run a $SHELL if there's
+    # spaces in the first arg and there's only 1 arg.
+    if args.size == 1
+      args = [ ENV["SHELL"], "-c", args[0] ]
+    end
     program = args[0]
 
     # Scan path to find the executable
@@ -27,13 +44,69 @@ module FPM::Util
     end
 
     @logger.debug("Running command", :args => args)
-    success = system(*args)
+
+    # Create a pair of pipes to connect the
+    # invoked process to the cabin logger
+    stdout_r, stdout_w = IO.pipe
+    stderr_r, stderr_w = IO.pipe
+
+    process           = ChildProcess.build(*args)
+    process.io.stdout = stdout_w
+    process.io.stderr = stderr_w
+
+    process.start
+    stdout_w.close; stderr_w.close
+    @logger.debug('Process is running', :pid => process.pid)
+    # Log both stdout and stderr as 'info' because nobody uses stderr for
+    # actually reporting errors and as a result 'stderr' is a misnomer.
+    @logger.pipe(stdout_r => :info, stderr_r => :info)
+
+    process.wait
+    success = (process.exit_code == 0)
+
     if !success
-      raise ProcessFailed.new("#{program} failed (exit code #{$?.exitstatus})" \
+      raise ProcessFailed.new("#{program} failed (exit code #{process.exit_code})" \
                               ". Full command was:#{args.inspect}")
     end
     return success
   end # def safesystem
+
+# Run a command safely in a way that captures output and status.
+  def safesystemout(*args)
+    if args.size == 1
+      args = [ ENV["SHELL"], "-c", args[0] ]
+    end
+    program = args[0]
+
+    if !program.include?("/") and !program_in_path?(program)
+      raise ExecutableNotFound.new(program)
+    end
+
+    @logger.debug("Running command", :args => args)
+
+    stdout_r, stdout_w = IO.pipe
+    stderr_r, stderr_w = IO.pipe
+
+    process           = ChildProcess.build(*args)
+    process.io.stdout = stdout_w
+    process.io.stderr = stderr_w
+
+    process.start
+    stdout_w.close; stderr_w.close
+    stdout_r_str = stdout_r.read
+    stdout_r.close; stderr_r.close
+    @logger.debug("Process is running", :pid => process.pid)
+
+    process.wait
+    success = (process.exit_code == 0)
+
+    if !success
+      raise ProcessFailed.new("#{program} failed (exit code #{process.exit_code})" \
+                              ". Full command was:#{args.inspect}")
+    end
+
+    return stdout_r_str
+  end # def safesystemout
 
   # Get the recommended 'tar' command for this platform.
   def tar_cmd
@@ -53,4 +126,18 @@ module FPM::Util
   def with(value, &block)
     block.call(value)
   end # def with
+
+  def copy_entry(src, dst)
+    case File.ftype(src)
+    when 'fifo'
+    when 'characterSpecial'
+    when 'blockSpecial'
+    when 'socket'
+      st = File.stat(src)
+      rc = mknod(dst, st.mode, st.dev)
+      raise SystemCallError.new("mknod error", FFI.errno) if rc == -1
+    else
+      FileUtils.copy_entry(src, dst)
+    end
+  end
 end # module FPM::Util

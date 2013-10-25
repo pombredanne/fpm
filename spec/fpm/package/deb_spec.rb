@@ -22,6 +22,11 @@ describe FPM::Package::Deb do
       insist { subject.architecture } == "amd64"
     end
 
+    it "should convert noarch to all" do
+      subject.architecture = "noarch"
+      insist { subject.architecture } == "all"
+    end
+
     it "should default to native" do
       expected = ""
       if program_in_path?("dpkg")
@@ -93,8 +98,7 @@ describe FPM::Package::Deb do
     end
 
     it "should replace underscores with dashes in the package name" do
-      # Insist the package.name does not include "_"
-      insist { insist { subject.name }.include?("_") }.fails
+      reject { subject.name }.include?("_")
     end
   end
 
@@ -118,7 +122,17 @@ describe FPM::Package::Deb do
       @original.dependencies << "hello >= 20"
       @original.provides = "#{@original.name} = #{@original.version}"
 
+      @original.conflicts = ["foo < 123"]
+      @original.attributes[:deb_breaks] = ["baz < 123"]
+
+      @original.attributes[:deb_build_depends_given?] = true
+      @original.attributes[:deb_build_depends] ||= []
+      @original.attributes[:deb_build_depends] << 'something-else > 0.0.0'
+      @original.attributes[:deb_build_depends] << 'something-else < 1.0.0'
+
       @original.attributes[:deb_priority] = "fizzle"
+      @original.attributes[:deb_field_given?] = true
+      @original.attributes[:deb_field] = { "foo" => "bar" }
       @original.output(@target)
 
       @input = FPM::Package::Deb.new
@@ -180,6 +194,22 @@ describe FPM::Package::Deb do
       it "should have the correct dependency list" do
         # 'something > 10' should convert to 'something (>> 10)', etc.
         insist { dpkg_field("Depends") } == "something (>> 10), hello (>= 20)"
+      end
+
+      it "should have the correct build dependency list" do
+        insist { dpkg_field("Build-Depends") } == "something-else (>> 0.0.0), something-else (<< 1.0.0)"
+      end
+
+      it "should have a custom field 'foo: bar'" do
+        insist { dpkg_field("foo") } == "bar"
+      end
+      
+      it "should have the correct Conflicts" do
+        insist { dpkg_field("Conflicts") } == "foo (<< 123)"
+      end
+
+      it "should have the correct Breaks" do
+        insist { dpkg_field("Breaks") } == "baz (<< 123)"
       end
     end
   end # #output

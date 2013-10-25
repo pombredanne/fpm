@@ -39,8 +39,12 @@ describe FPM::Package::RPM do
   end
 
   describe "#epoch" do
-    it "should default to 1" do
-      insist { subject.epoch } == "1"
+    it "should default to empty" do
+      insist { subject.epoch.to_s } == ""
+    end
+    it "should cope with it being zero" do
+      subject.epoch = 0
+      insist { subject.epoch.to_s } == "0"
     end
   end
   
@@ -57,9 +61,10 @@ describe FPM::Package::RPM do
     end
   end
 
+
   describe "#templating" do
     context "default user and group" do
-      before :all do
+      before :each do
         FileUtils.mkdir_p(subject.staging_path(File.dirname(__FILE__)))
         FileUtils.cp(__FILE__, subject.staging_path(__FILE__))
 
@@ -70,7 +75,7 @@ describe FPM::Package::RPM do
         subject.render_template
       end
 
-      after :all do
+      after :each do
         subject.cleanup
       end
 
@@ -80,7 +85,7 @@ describe FPM::Package::RPM do
     end # context
 
     context "non-default user and group" do
-      before :all do
+      before :each do
         subject.attributes[:rpm_user] = "some_user"
         subject.attributes[:rpm_group] = "some_group"
 
@@ -94,7 +99,7 @@ describe FPM::Package::RPM do
         subject.render_template
       end
 
-      after :all do
+      after :each do
         subject.cleanup
       end
 
@@ -106,7 +111,7 @@ describe FPM::Package::RPM do
 
   describe "#output", :if => program_in_path?("rpmbuild") do
     context "package attributes" do
-      before :all do
+      before :each do
         @target = Tempfile.new("fpm-test-rpm").path
         File.delete(@target)
         subject.name = "name"
@@ -139,12 +144,12 @@ describe FPM::Package::RPM do
         @rpm.header.tags.each do |tag|
           @rpmtags[tag.tag] = tag.value
         end
-      end # before :all
+      end # before :each
 
-      after :all do
+      after :each do
         subject.cleanup
         File.delete(@target)
-      end # after :all
+      end # after :each
 
       it "should have the correct name" do
         insist { @rpmtags[:name] } == subject.name
@@ -236,7 +241,7 @@ describe FPM::Package::RPM do
     end # package attributes
 
     context "package default attributes" do
-      before :all do
+      before :each do
         @target = Tempfile.new("fpm-test-rpm").path
         File.delete(@target)
         subject.name = "name"
@@ -251,12 +256,12 @@ describe FPM::Package::RPM do
         @rpm.header.tags.each do |tag|
           @rpmtags[tag.tag] = tag.value
         end
-      end # before :all
+      end # before :each
 
-      after :all do
+      after :each do
         subject.cleanup
         File.delete(@target)
-      end # after :all
+      end # after :each
 
       it "should have the correct name" do
         insist { @rpmtags[:name] } == subject.name
@@ -318,14 +323,25 @@ describe FPM::Package::RPM do
 
     after :each do
       subject.cleanup
-      File.delete(@target)
+      File.delete(@target) rescue nil
     end # after
+
+    it "should escape '%' characters in filenames" do
+      Dir.mkdir(subject.staging_path("/example"))
+      File.write(subject.staging_path("/example/%name%"), "Hello")
+      subject.output(@target)
+
+      rpm = ::RPM::File.new(@target)
+      insist { rpm.files } == [ "/example/%name%" ]
+    end
 
     it "should permit spaces in filenames (issue #164)" do
       File.write(subject.staging_path("file with space"), "Hello")
 
       # This will raise an exception if rpmbuild fails.
       subject.output(@target)
+      rpm = ::RPM::File.new(@target)
+      insist { rpm.files } == [ "/file with space" ]
     end
 
     it "should permit brackets in filenames (issue #202)" do
@@ -333,6 +349,8 @@ describe FPM::Package::RPM do
 
       # This will raise an exception if rpmbuild fails.
       subject.output(@target)
+      rpm = ::RPM::File.new(@target)
+      insist { rpm.files } == [ "/file[with]bracket" ]
     end
 
     it "should permit asterisks in filenames (issue #202)" do
@@ -340,6 +358,8 @@ describe FPM::Package::RPM do
 
       # This will raise an exception if rpmbuild fails.
       subject.output(@target)
+      rpm = ::RPM::File.new(@target)
+      insist { rpm.files } == [ "/file*asterisk" ]
     end
 
     it "should have some reasonable defaults that never change" do
@@ -352,9 +372,9 @@ describe FPM::Package::RPM do
         rpmtags[tag.tag] = tag.value
       end
 
-      # Default epoch must be '1'
+      # Default epoch must be empty, see #381
       # For some reason, epoch is an array of numbers in rpm?
-      insist { rpmtags[:epoch] } == [1]
+      insist { rpmtags[:epoch] } == nil
 
       # Default release must be '1'
       insist { rpmtags[:release] } == "1"
@@ -363,7 +383,7 @@ describe FPM::Package::RPM do
 
   describe "#output with digest and compression settings", :if => program_in_path?("rpmbuild") do
     context "bzip2/sha1" do
-      before :all do
+      before :each do
         @target = Tempfile.new("fpm-test-rpm").path
         File.delete(@target)
         subject.name = "name"
@@ -386,7 +406,7 @@ describe FPM::Package::RPM do
         end
       end
 
-      after :all do
+      after :each do
         subject.cleanup
         File.delete(@target)
       end # after

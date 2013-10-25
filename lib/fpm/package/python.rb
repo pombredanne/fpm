@@ -49,15 +49,20 @@ class FPM::Package::Python < FPM::Package
     "be in lowercase?", :default => true
 
   option "--install-bin", "BIN_PATH", "The path to where python scripts " \
-    "should be installed to.", :default => "/usr/bin"
+    "should be installed to."
   option "--install-lib", "LIB_PATH", "The path to where python libs " \
     "should be installed to (default depends on your python installation). " \
     "Want to what your target platform is using? Run this: " \
     "python -c 'from distutils.sysconfig import get_python_lib; " \
     "print get_python_lib()'"
-  option "--install-data", "DATA_PATH", "The path to where data should be." \
+  option "--install-data", "DATA_PATH", "The path to where data should be " \
     "installed to. This is equivalent to 'python setup.py --install-data " \
     "DATA_PATH"
+  option "--dependencies", :flag, "Include requirements defined in setup.py" \
+    " as dependencies.", :default => true
+  option "--obey-requirements-txt", :flag, "Use a requirements.txt file " \
+    "in the top-level directory of the python package for dependency " \
+    "detection.", :default => false
 
   private
 
@@ -110,12 +115,12 @@ class FPM::Package::Python < FPM::Package
 
     if attributes[:python_pip].nil?
       # no pip, use easy_install
-      puts "EASY_INSTALL"
+      @logger.debug("no pip, defaulting to easy_install", :easy_install => attributes[:python_easyinstall])
       safesystem(attributes[:python_easyinstall], "-i",
                  attributes[:python_pypi], "--editable", "-U",
                  "--build-directory", target, want_pkg)
     else
-      puts "PIP PIP CHEERIOS"
+      @logger.debug("using pip", :pip => attributes[:python_pip])
       safesystem(attributes[:python_pip], "install", "--no-install",
                  "-U", "--build", target, want_pkg)
     end
@@ -143,26 +148,37 @@ class FPM::Package::Python < FPM::Package
     setup_dir = File.dirname(setup_py)
 
     output = ::Dir.chdir(setup_dir) do
+      tmp = build_path("metadata.json")
       setup_cmd = "env PYTHONPATH=#{pylib} #{attributes[:python_bin]} " \
-        "setup.py --command-packages=pyfpm get_metadata"
+        "setup.py --command-packages=pyfpm get_metadata --output=#{tmp}"
+
+      if attributes[:python_obey_requirements_txt?]
+        setup_cmd += " --load-requirements-txt"
+      end
+
       # Capture the output, which will be JSON metadata describing this python
       # package. See fpm/lib/fpm/package/pyfpm/get_metadata.py for more
       # details.
-      output = `#{setup_cmd}`
-      if !$?.success?
+      @logger.info("fetching package metadata", :setup_cmd => setup_cmd)
+
+      success = safesystem(setup_cmd)
+      #%x{#{setup_cmd}}
+      if !success
         @logger.error("setup.py get_metadata failed", :command => setup_cmd,
-                      :exitcode => $?.exitcode)
+                      :exitcode => $?.exitstatus)
         raise "An unexpected error occurred while processing the setup.py file"
       end
-      output
+      File.read(tmp)
     end
-    @logger.debug("full text from `setup.py get_metadata`", :data => output)
-    metadata = JSON.parse(output[/\{.*\}/msx])
+    @logger.debug("result from `setup.py get_metadata`", :data => output)
+    metadata = JSON.parse(output)
     @logger.info("object output of get_metadata", :json => metadata)
 
     self.architecture = metadata["architecture"]
     self.description = metadata["description"]
-    self.license = metadata["license"]
+    # Sometimes the license field is multiple lines; do best-effort and just
+    # use the first line.
+    self.license = metadata["license"].split(/[\r\n]+/).first
     self.version = metadata["version"]
     self.url = metadata["url"]
 
@@ -177,42 +193,32 @@ class FPM::Package::Python < FPM::Package
     # convert python-Foo to python-foo if flag is set
     self.name = self.name.downcase if attributes[:python_downcase_name?]
 
-    requirements_txt = File.join(setup_dir, "requirements.txt")
-    if File.exists?(requirements_txt)
-      @logger.info("Found requirements.txt, using it instead of setup.py " \
-                    "for dependency information", :path => requirements_txt)
-      @logger.debug("Clearing dependency list (from setup.py) in prep for " \
-                    "reading requirements.txt")
-      # Best I can tell, requirements.txt are a superset of what
-      # is already supported as 'dependencies' in setup.py
-      # So we'll parse them the same way below.
-      
-      # requirements.txt can have dependencies, flags, and comments.
-      # We only want the comments, so remove comment and flag lines.
-      metadata["dependencies"] = File.read(requirements_txt).split("\n") \
-        .reject { |l| l =~ /^\s*$/ } \
-        .reject { |l| l =~ /^\s*#/ } \
-        .reject { |l| l =~ /^-/ } \
-        .map(&:strip)
-    end
+    if !attributes[:no_auto_depends?] and attributes[:python_dependencies?]
+      self.dependencies = metadata["dependencies"].collect do |dep|
+        dep_re = /^([^<>!= ]+)\s*(?:([<>!=]{1,2})\s*(.*))?$/
+        match = dep_re.match(dep)
+        if match.nil?
+          @logger.error("Unable to parse dependency", :dependency => dep)
+          raise FPM::InvalidPackageConfiguration, "Invalid dependency '#{dep}'"
+        end
+        name, cmp, version = match.captures
 
-    self.dependencies += metadata["dependencies"].collect do |dep|
-      dep_re = /^([^<>!= ]+)\s*(?:([<>!=]{1,2})\s*(.*))?$/
-      match = dep_re.match(dep)
-      if match.nil?
-        @logger.error("Unable to parse dependency", :dependency => dep)
-        raise FPM::InvalidPackageConfiguration, "Invalid dependency '#{dep}'"
+        # convert == to =
+        if cmp == "=="
+          @logger.info("Converting == dependency requirement to =", :dependency => dep )
+          cmp = "="
+        end
+
+        # dependency name prefixing is optional, if enabled, a name 'foo' will
+        # become 'python-foo' (depending on what the python_package_name_prefix
+        # is)
+        name = fix_name(name) if attributes[:python_fix_dependencies?]
+
+        # convert dependencies from python-Foo to python-foo
+        name = name.downcase if attributes[:python_downcase_dependencies?]
+        "#{name} #{cmp} #{version}"
       end
-      name, cmp, version = match.captures
-      # dependency name prefixing is optional, if enabled, a name 'foo' will
-      # become 'python-foo' (depending on what the python_package_name_prefix
-      # is)
-      name = fix_name(name) if attributes[:python_fix_dependencies?]
-
-      # convert dependencies from python-Foo to python-foo
-      name = name.downcase if attributes[:python_downcase_dependencies?]
-      "#{name} #{cmp} #{version}"
-    end
+    end # if attributes[:python_dependencies?]
   end # def load_package_info
 
   # Sanitize package name.
@@ -243,13 +249,29 @@ class FPM::Package::Python < FPM::Package
       flags = [ "--root", staging_path ]
       if !attributes[:python_install_lib].nil?
         flags += [ "--install-lib", File.join(prefix, attributes[:python_install_lib]) ]
+      elsif !attributes[:prefix].nil?
+        # setup.py install --prefix PREFIX still installs libs to
+        # PREFIX/lib64/python2.7/site-packages/
+        # but we really want something saner.
+        #
+        # since prefix is given, but not python_install_lib, assume PREFIX/lib
+        flags += [ "--install-lib", File.join(prefix, "lib") ]
       end
+
       if !attributes[:python_install_data].nil?
         flags += [ "--install-data", File.join(prefix, attributes[:python_install_data]) ]
+      elsif !attributes[:prefix].nil?
+        # prefix given, but not python_install_data, assume PREFIX/data
+        flags += [ "--install-data", File.join(prefix, "data") ]
       end
+
       if !attributes[:python_install_bin].nil?
         flags += [ "--install-scripts", File.join(prefix, attributes[:python_install_bin]) ]
+      elsif !attributes[:prefix].nil?
+        # prefix given, but not python_install_bin, assume PREFIX/bin
+        flags += [ "--install-scripts", File.join(prefix, "bin") ]
       end
+
       safesystem(attributes[:python_bin], "setup.py", "install", *flags)
     end
   end # def install_to_staging

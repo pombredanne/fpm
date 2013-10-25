@@ -5,6 +5,7 @@ require "fpm/errors"
 require "fpm/util"
 require "backports"
 require "fileutils"
+require "digest"
 
 # Support for debian packages (.deb files)
 #
@@ -27,6 +28,12 @@ class FPM::Package::Deb < FPM::Package
             "version. Default is to be specific. This option allows the same " \
             "version of a package but any iteration is permitted"
 
+  option "--build-depends", "DEPENDENCY",
+    "Add DEPENDENCY as a Build-Depends" do |dep|
+    @build_depends ||= []
+    @build_depends << dep
+  end
+
   option "--pre-depends", "DEPENDENCY",
     "Add DEPENDENCY as a Pre-Depends" do |dep|
     @pre_depends ||= []
@@ -47,13 +54,13 @@ class FPM::Package::Deb < FPM::Package
     "Custom version of the Debian control file." do |control|
     File.expand_path(control)
   end
-    
+
   # Add custom debconf config file
   option "--config", "SCRIPTPATH",
     "Add SCRIPTPATH as debconf config file." do |config|
      File.expand_path(config)
   end
-    
+
   # Add custom debconf templates file
   option "--templates", "FILEPATH",
     "Add FILEPATH as debconf templates file." do |templates|
@@ -69,9 +76,9 @@ class FPM::Package::Deb < FPM::Package
   option "--priority", "PRIORITY", 
     "The debian package 'priority' value.", :default => "extra"
 
-  option "--user", "USER", "The owner of files in this package"
+  option "--user", "USER", "The owner of files in this package", :default => 'root'
 
-  option "--group", "GROUP", "The group owner of files in this package"
+  option "--group", "GROUP", "The group owner of files in this package", :default => 'root'
 
   option "--changelog", "FILEPATH", "Add FILEPATH as debian changelog" do |file|
     File.expand_path(file)
@@ -80,11 +87,40 @@ class FPM::Package::Deb < FPM::Package
   option "--recommends", "PACKAGE", "Add PACKAGE to Recommends" do |pkg|
     @recommends ||= []
     @recommends << pkg
+    next @recommends
   end
 
   option "--suggests", "PACKAGE", "Add PACKAGE to Suggests" do |pkg|
     @suggests ||= []
     @suggests << pkg
+    next @suggests
+  end
+
+  option "--field", "'FIELD: VALUE'", "Add custom field to the control file" do |fv|
+    @custom_fields ||= {}
+    field, value = fv.split(/: */, 2)
+    @custom_fields[field] = value
+    next @custom_fields
+  end
+
+  option "--shlibs", "SHLIBS", "Include control/shlibs content. This flag " \
+    "expects a string that is used as the contents of the shlibs file. " \
+    "See the following url for a description of this file and its format: " \
+    "http://www.debian.org/doc/debian-policy/ch-sharedlibs.html#s-shlibs"
+
+  option "--init", "FILEPATH", "Add FILEPATH as an init script",
+	:multivalued => true do |file|
+    next File.expand_path(file)
+  end
+
+  option "--default", "FILEPATH", "Add FILEPATH as /etc/default configuration",
+	:multivalued => true do |file|
+    next File.expand_path(file)
+  end
+
+  option "--upstart", "FILEPATH", "Add FILEPATH as an upstart script",
+	:multivalued => true do |file|
+    next File.expand_path(file)
   end
 
   def initialize(*args)
@@ -111,9 +147,14 @@ class FPM::Package::Deb < FPM::Package
         @architecture = %x{uname -m}.chomp
       end
     end
-    if @architecture == "x86_64"
+
+    case @architecture
+    when "x86_64"
       # Debian calls x86_64 "amd64"
       @architecture = "amd64"
+    when "noarch"
+      # Debian calls noarch "all"
+      @architecture = "all"
     end
     return @architecture
   end # def architecture
@@ -168,7 +209,7 @@ class FPM::Package::Deb < FPM::Package
           return value.split(": ",2).last
         end
       end
-      
+
       # Parse 'epoch:version-iteration' in the version string
       version_re = /^(?:([0-9]+):)?(.+?)(?:-(.*))?$/
       m = version_re.match(parse.call("Version"))
@@ -195,7 +236,7 @@ class FPM::Package::Deb < FPM::Package
 
       #self.config_files = config_files
 
-      self.dependencies += parse_depends(parse.call("Depends"))
+      self.dependencies += parse_depends(parse.call("Depends")) if !attributes[:no_auto_depends?]
     end
   end # def extract_info
 
@@ -258,10 +299,26 @@ class FPM::Package::Deb < FPM::Package
   def output(output_path)
     output_check(output_path)
     # Abort if the target path already exists.
-    raise FileAlreadyExists.new(output_path) if File.exists?(output_path)
 
     # create 'debian-binary' file, required to make a valid debian package
     File.write(build_path("debian-binary"), "2.0\n")
+
+    # If we are given --deb-shlibs but no --after-install script, we
+    # should implicitly create a before/after scripts that run ldconfig
+    if attributes[:deb_shlibs] 
+      if !script?(:after_install)
+        @logger.info("You gave --deb-shlibs but no --after-install, so " \
+                     "I am adding an after-install script that runs " \
+                     "ldconfig to update the system library cache")
+        scripts[:after_install] = template("deb/ldconfig.sh.erb").result(binding)
+      end
+      if !script?(:after_remove)
+        @logger.info("You gave --deb-shlibs but no --after-remove, so " \
+                     "I am adding an after-remove script that runs " \
+                     "ldconfig to update the system library cache")
+        scripts[:after_remove] = template("deb/ldconfig.sh.erb").result(binding)
+      end
+    end
 
     write_control_tarball
 
@@ -280,20 +337,59 @@ class FPM::Package::Deb < FPM::Package
         raise FPM::InvalidPackageConfiguration,
           "Unknown compression type '#{self.attributes[:deb_compression]}'"
     end
+
     tar_flags = []
     if !attributes[:deb_user].nil?
-      tar_flags += [ "--owner", attributes[:deb_user] ]
+      if attributes[:deb_user] == 'root'
+        tar_flags += [ "--numeric-owner", "--owner", "0" ]
+      else
+        tar_flags += [ "--owner", attributes[:deb_user] ]
+      end
     end
+
     if !attributes[:deb_group].nil?
-      tar_flags += [ "--group", attributes[:deb_group] ]
+      if attributes[:deb_group] == 'root'
+        tar_flags += [ "--numeric-owner", "--group", "0" ]
+      else
+        tar_flags += [ "--group", attributes[:deb_group] ]
+      end
     end
 
     if attributes[:deb_changelog]
-      dest_changelog = File.join(staging_path, "usr/share/doc/#{attributes[:name]}/changelog.Debian")
+      dest_changelog = File.join(staging_path, "usr/share/doc/#{name}/changelog.Debian")
       FileUtils.mkdir_p(File.dirname(dest_changelog))
       FileUtils.cp attributes[:deb_changelog], dest_changelog
-      safesystem("gzip", dest_changelog)
       File.chmod(0644, dest_changelog)
+      safesystem("gzip", dest_changelog)
+    end
+
+    attributes.fetch(:deb_init_list, []).each do |init|
+      name = File.basename(init, ".init")
+      dest_init = File.join(staging_path, "etc/init.d/#{name}")
+      FileUtils.mkdir_p(File.dirname(dest_init))
+      FileUtils.cp init, dest_init
+      File.chmod(0755, dest_init)
+    end
+
+    attributes.fetch(:deb_default_list, []).each do |default|
+      name = File.basename(default, ".default")
+      dest_default = File.join(staging_path, "etc/default/#{name}")
+      FileUtils.mkdir_p(File.dirname(dest_default))
+      FileUtils.cp default, dest_default
+      File.chmod(0644, dest_default)
+    end
+
+    attributes.fetch(:deb_upstart_list, []).each do |upstart|
+      name = File.basename(upstart, ".upstart")
+      dest_upstart = staging_path("etc/init/#{name}.conf")
+      FileUtils.mkdir_p(File.dirname(dest_upstart))
+      FileUtils.cp(upstart, dest_upstart)
+      File.chmod(0644, dest_upstart)
+
+      # Install an init.d shim that calls upstart
+      dest_init = staging_path("/etc/init.d/#{name}")
+      FileUtils.mkdir_p(File.dirname(dest_init))
+      FileUtils.ln_s("/lib/init/upstart-job", dest_init)
     end
 
     args = [ tar_cmd, "-C", staging_path, compression ] + tar_flags + [ "-cf", datatar, "." ]
@@ -340,13 +436,13 @@ class FPM::Package::Deb < FPM::Package
     if name =~ /[A-Z]/
       @logger.warn("Downcasing dependency '#{name}' because deb packages " \
                    " don't work so good with uppercase names")
-      dep.gsub!(name_re) { |n| n.downcase }
+      dep = dep.gsub(name_re) { |n| n.downcase }
     end
 
     if dep.include?("_")
       @logger.warn("Replacing underscores with dashes in '#{dep}' because " \
                    "debs don't like underscores")
-      dep.gsub!("_", "-")
+      dep = dep.gsub("_", "-")
     end
 
     # Convert gem ~> X.Y.Z to '>= X.Y.Z' and << X.Y+1.0
@@ -359,8 +455,9 @@ class FPM::Package::Deb < FPM::Package
       nextversion = nextversion.join(".")
       return ["#{name} (>= #{version})", "#{name} (<< #{nextversion})"]
     elsif (m = dep.match(/(\S+)\s+\(!= (.+)\)/))
-      # Append this to conflicts
-      self.conflicts += [dep.gsub(/!=/,"=")]
+      # Move '!=' dependency specifications into 'Breaks'
+      self.attributes[:deb_breaks] ||= []
+      self.attributes[:deb_breaks] << dep.gsub(/!=/,"=")
       return []
     elsif (m = dep.match(/(\S+)\s+\(= (.+)\)/)) and
         self.attributes[:deb_ignore_iteration_in_dependencies?]
@@ -371,6 +468,10 @@ class FPM::Package::Deb < FPM::Package
       nextversion[-1] += 1
       nextversion = nextversion.join(".")
       return ["#{name} (>= #{version})", "#{name} (<< #{nextversion})"]
+    elsif (m = dep.match(/(\S+)\s+\(> (.+)\)/))
+      # Convert 'foo (> x) to 'foo (>> x)'
+      name, version = m[1..2]
+      return ["#{name} (>> #{version})"]
     else
       # otherwise the dep is probably fine
       return dep.rstrip
@@ -391,15 +492,19 @@ class FPM::Package::Deb < FPM::Package
   def write_control_tarball
     # Use custom Debian control file when given ...
     write_control # write the control file
+    write_shlibs # write optional shlibs file
     write_scripts # write the maintainer scripts
     write_conffiles # write the conffiles
     write_debconf # write the debconf files
+    write_md5sums # write the md5sums file
 
     # Make the control.tar.gz
     with(build_path("control.tar.gz")) do |controltar|
       @logger.info("Creating", :path => controltar, :from => control_path)
-      safesystem(tar_cmd, "--numeric-owner", "--owner=0", "--group=0", "-zcf",
-                 controltar, "-C", control_path, ".")
+
+      args = [ tar_cmd, "-C", control_path, "-zcf", controltar, 
+        "--owner=0", "--group=0", "--numeric-owner", "." ]
+      safesystem(*args)
     end
 
     @logger.debug("Removing no longer needed control dir", :path => control_path)
@@ -408,6 +513,9 @@ class FPM::Package::Deb < FPM::Package
   end # def write_control_tarball
 
   def write_control
+    # warn user if epoch is set
+    @logger.warn("epoch in Version is set", :epoch => self.epoch) if self.epoch
+
     # calculate installed-size if necessary:
     if attributes[:deb_installed_size].nil?
       @logger.info("No deb_installed_size set, calculating now.")
@@ -457,12 +565,37 @@ class FPM::Package::Deb < FPM::Package
   end # def write_scripts
 
   def write_conffiles
+    return unless config_files.any?
+
+    # scan all conf file paths for files and add them
+    allconfigs = []
+    config_files.each do |path|
+      cfg_path = File.expand_path(path, staging_path)
+      begin
+        Find.find(cfg_path) do |p|
+          allconfigs << p.gsub("#{staging_path}/", '') if File.file? p
+        end
+      rescue Errno::ENOENT => e
+        raise FPM::InvalidPackageConfiguration,
+          "Error trying to use '#{cfg_path}' as a config file in the package. Does it exist?"
+      end
+    end
+    allconfigs.sort!.uniq!
+
     File.open(control_path("conffiles"), "w") do |out|
       # 'config_files' comes from FPM::Package and is usually set with
       # FPM::Command's --config-files flag
-      config_files.each { |cf| out.puts(cf) }
+      allconfigs.each { |cf| out.puts(cf) }
     end
   end # def write_conffiles
+
+  def write_shlibs
+    return unless attributes[:deb_shlibs]
+    @logger.info("Adding shlibs", :content => attributes[:deb_shlibs])
+    File.open(control_path("shlibs"), "w") do |out|
+      out.write(attributes[:deb_shlibs])
+    end
+  end # def write_shlibs
 
   def write_debconf
     if attributes[:deb_config]
@@ -475,6 +608,26 @@ class FPM::Package::Deb < FPM::Package
       File.chmod(0755, control_path("templates"))
     end
   end # def write_debconf
+
+  def write_md5sums
+    md5_sums = {}
+
+    Find.find(staging_path) do |path|
+      if File.file?(path) && !File.symlink?(path)
+        md5 = Digest::MD5.file(path).hexdigest
+        md5_path = path.gsub("#{staging_path}/", "")
+        md5_sums[md5_path] = md5
+      end
+    end
+
+    if not md5_sums.empty?
+      File.open(control_path("md5sums"), "w") do |out|
+        md5_sums.each do |path, md5|
+          out.puts "#{md5} #{path}"
+        end
+      end
+    end
+  end # def write_md5sums
 
   def to_s(format=nil)
     # Default format if nil

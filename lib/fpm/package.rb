@@ -1,6 +1,7 @@
 require "fpm/namespace" # local
 require "fpm/util" # local
 require "pathname" # stdlib
+require "find"
 require "tmpdir" # stdlib
 require "backports" # gem 'backports'
 require "socket" # stdlib, for Socket.gethostname
@@ -92,13 +93,13 @@ class FPM::Package
   # (Not all packages support this)
   attr_accessor :replaces
 
-  # Array of glob patterns to exclude from this package
-  attr_accessor :excludes
-
   # a summary or description of the package
   attr_accessor :description
 
-  # hash of paths for maintainer/package scripts (postinstall, etc)
+  # hash of scripts for maintainer/package scripts (postinstall, etc)
+  #
+  # The keys are :before_install, etc
+  # The values are the text to use in the script.
   attr_accessor :scripts
 
   # Array of configuration files
@@ -194,7 +195,7 @@ class FPM::Package
 
     # copy other bits
     ivars = [
-      :@architecture, :@attributes, :@category, :@config_files, :@conflicts,
+      :@architecture, :@category, :@config_files, :@conflicts,
       :@dependencies, :@description, :@epoch, :@iteration, :@license, :@maintainer,
       :@name, :@provides, :@replaces, :@scripts, :@url, :@vendor, :@version,
       :@directories, :@staging_path
@@ -204,6 +205,11 @@ class FPM::Package
                     #:from => self.type, :to => pkg.type)
       pkg.instance_variable_set(ivar, instance_variable_get(ivar))
     end
+
+    # Attributes are special! We do not want to remove the default values of
+    # the destination package type unless their value is specified on the
+    # source package object.
+    pkg.attributes.merge!(self.attributes)
 
     pkg.converted_from(self.class)
     return pkg
@@ -311,8 +317,11 @@ class FPM::Package
       .collect { |path| path[staging_path.length + 1.. -1] }
   end # def files
  
+  def template_dir
+    File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "templates"))
+  end
+
   def template(path)
-    template_dir = File.join(File.dirname(__FILE__), "..", "..", "templates")
     template_path = File.join(template_dir, path)
     template_code = File.read(template_path)
     @logger.info("Reading template", :path => template_path)
@@ -337,7 +346,13 @@ class FPM::Package
   def edit_file(path)
     editor = ENV['FPM_EDITOR'] || ENV['EDITOR'] || 'vi'
     @logger.info("Launching editor", :file => path)
-    safesystem("#{editor} #{Shellwords.escape(path)}")
+    command = "#{editor} #{Shellwords.escape(path)}"
+    system("#{editor} #{Shellwords.escape(path)}")
+    if !$?.success?
+      raise ProcessFailed.new("'#{editor}' failed (exit code " \
+                              "#{$?.exitstatus}) Full command was: "\
+                              "#{command}");
+    end
 
     if File.size(path) == 0
       raise "Empty file after editing: #{path.inspect}"
@@ -355,43 +370,20 @@ class FPM::Package
       installdir = staging_path
     end
 
-    exclude_path = proc do |file|
-      FileUtils.remove_entry_secure(staging_path(file))
-      Pathname.new(staging_path(file)).parent.ascend do |d|
-        if (::Dir.entries(d) - %w[ . .. ]).empty?
-          ::Dir.rmdir(d)
-          @logger.info("Deleting empty directory left by removing exluded file", :path => d)
-        else
+    Find.find(installdir) do |path|
+      match_path = path.sub("#{installdir}/", '')
+
+      attributes[:excludes].each do |wildcard|
+        @logger.debug("Checking path against wildcard", :path => match_path, :wildcard => wildcard)
+
+        if File.fnmatch(wildcard, match_path)
+          @logger.info("Removing excluded path", :path => match_path, :matches => wildcard)
+          FileUtils.remove_entry_secure(path)
+          Find.prune
           break
         end
       end
-    end # exclude_path
-
-    attributes[:excludes].each do |wildcard|
-      @logger.debug("Checking for things to exclude", :wildcard => wildcard)
-      files.each do |file|
-        @logger.debug("Checking path against wildcard", :path => file, :wildcard => wildcard)
-        if File.fnmatch(wildcard, file)
-          @logger.info("Removing excluded file", :path => file, :matches => wildcard)
-          exclude_path.call(file)
-          next
-        end
-
-        @logger.debug("Checking if path is a child of an excluded directory",
-                      :path => file, :wildcard => wildcard,
-                      :directory? => File.directory?(staging_path(wildcard)))
-        if File.directory?(staging_path(wildcard))
-          # issue #248, if the excludes entry is a directory, ignore that
-          # directory and anything inside it.
-          exclude_re = Regexp.new("^#{Regexp.escape(wildcard)}($|/)")
-          if exclude_re.match(file)
-            @logger.info("Removing excluded file which has a parent excluded directory",
-                         :path => file, :excluded => wildcard)
-            exclude_path.call(file)
-          end
-        end
-      end 
-    end # files.each
+    end
   end # def exclude
 
 
@@ -449,7 +441,7 @@ class FPM::Package
     def default_attributes(&block)
       return if @options.nil?
       @options.each do |flag, param, help, options, block|
-        attr = flag.first.gsub(/^-+/, "").gsub(/-/, "_")
+        attr = flag.first.gsub(/^-+/, "").gsub(/-/, "_").gsub("[no_]", "")
         attr += "?" if param == :flag
         yield attr.to_sym, options[:default]
       end
@@ -502,6 +494,14 @@ class FPM::Package
   def output_check(output_path)
     if !File.directory?(File.dirname(output_path))
       raise ParentDirectoryMissing.new(output_path)
+    end
+    if File.file?(output_path)
+      if attributes[:force?]
+        @logger.warn("Force flag given. Overwriting package at #{output_path}")
+        File.delete(output_path)
+      else
+        raise FileAlreadyExists.new(output_path)
+      end
     end
   end # def output_path
 

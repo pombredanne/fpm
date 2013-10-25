@@ -1,11 +1,11 @@
 from distutils.core import Command
-import re
-import time
+import os
 import pkg_resources
 try:
     import json
 except ImportError:
     import simplejson as json
+
 
 # Note, the last time I coded python daily was at Google, so it's entirely
 # possible some of my techniques below are outdated or bad.
@@ -13,64 +13,72 @@ except ImportError:
 
 
 class get_metadata(Command):
-  description = "get package metadata"
-  user_options = []
+    description = "get package metadata"
+    user_options = [
+        ('load-requirements-txt', 'l',
+         "load dependencies from requirements.txt"),
+        ("output=", "o", "output destination for metadata json")
+    ]
+    boolean_options = ['load-requirements-txt']
 
-  def initialize_options(self):
-    pass
-  # def initialize_options
+    def initialize_options(self):
+        self.load_requirements_txt = False
+        self.cwd = None
+        self.output = None
 
-  def finalize_options(self):
-    pass
-  # def finalize_options
+    def finalize_options(self):
+        self.cwd = os.getcwd()
+        self.requirements_txt = os.path.join(self.cwd, "requirements.txt")
+        # make sure we have a requirements.txt
+        if self.load_requirements_txt:
+            self.load_requirements_txt = os.path.exists(self.requirements_txt)
 
-  def run(self):
-    #print type(self.distribution)
-    #for i in sorted(dir(self.distribution)):
-      #if i.startswith("_"):
-        #continue
-      ###print "%s: %r" % (i, self.__getattr__(i))
-      #print "%s" % i
+    def process_dep(self, dep):
+        deps = []
+        if dep.specs:
+            for operator, version in dep.specs:
+                deps.append("%s %s %s" % (dep.project_name,
+                        operator, version))
+        else:
+            deps.append(dep.project_name)
 
-    data = {
-      "name": self.distribution.get_name(),
-      "version": self.distribution.get_version(),
-      "author": "%s <%s>" % (self.distribution.get_author(),
-        self.distribution.get_author_email()),
-      "description": self.distribution.get_description(),
-      "license": self.distribution.get_license(),
-      "url": self.distribution.get_url(),
-    }
+        return deps
 
-    # If there are python C/extension modules, we'll want to build a native
-    # arch package.
-    if self.distribution.has_ext_modules():
-      data["architecture"] = "native"
-    else:
-      data["architecture"] = "all"
-    # end if
+    def run(self):
+        data = {
+            "name": self.distribution.get_name(),
+            "version": self.distribution.get_version(),
+            "author": "%s <%s>" % (
+                self.distribution.get_author(),
+                self.distribution.get_author_email(),
+            ),
+            "description": self.distribution.get_description(),
+            "license": self.distribution.get_license(),
+            "url": self.distribution.get_url(),
+        }
 
-    final_deps = []
-    if getattr(self.distribution, 'install_requires', None):
-        for dep in pkg_resources.parse_requirements(self.distribution.install_requires):
-            # add all defined specs to the dependecy list separately.
-            if dep.specs:
-                for operator, version in dep.specs:
-                    final_deps.append("%s %s %s" % (
-                        dep.project_name,
-                        "=" if operator == "==" else operator,
-                        version
-                    ))
-            else:
-                final_deps.append(dep.project_name)            
+        if self.distribution.has_ext_modules():
+            data["architecture"] = "native"
+        else:
+            data["architecture"] = "all"
 
-    data["dependencies"] = final_deps
+        final_deps = []
 
-    #print json.dumps(data, indent=2)
-    if hasattr(json, 'dumps'):
-        print(json.dumps(data, indent=2))
-    else:
-        # For Python 2.5 and Debian's python-json
-        print(json.write(data))
-  # def run
-# class list_dependencies
+        if self.load_requirements_txt:
+            requirement = open(self.requirements_txt).readlines()
+            for dep in pkg_resources.parse_requirements(requirement):
+                final_deps.extend(self.process_dep(dep))
+        else:
+            if getattr(self.distribution, 'install_requires', None):
+                for dep in pkg_resources.parse_requirements(
+                        self.distribution.install_requires):
+                    final_deps.extend(self.process_dep(dep))
+
+        data["dependencies"] = final_deps
+
+        output = open(self.output, "w")
+        if hasattr(json, 'dumps'):
+            output.write(json.dumps(data, indent=2))
+        else:
+            # For Python 2.5 and Debian's python-json
+            output.write(json.write(data))

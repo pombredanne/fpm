@@ -1,4 +1,5 @@
 require "fpm/package"
+require "fpm/util"
 require "backports"
 require "fileutils"
 require "find"
@@ -14,6 +15,15 @@ class FPM::Package::Dir < FPM::Package
 
   # Add a new path to this package.
   #
+  # A special handling of the path occurs if it includes a '=' symbol.
+  # You can say "source=destination" and it will copy files from that source
+  # to the given destination in the package.
+  #
+  # This lets you take a local directory and map it to the desired location at
+  # packaging time. Such as: "./src/redis-server=/usr/local/bin" will make
+  # the local file ./src/redis-server appear as /usr/local/bin/redis-server in
+  # your package.
+  #
   # If the path is a directory, it is copied recursively. The behavior
   # of the copying is modified by the :chdir and :prefix attributes.
   #
@@ -27,14 +37,46 @@ class FPM::Package::Dir < FPM::Package
   #     package.attributes[:chdir] = "/etc"
   #     package.input("X11")
   def input(path)
-    @logger.debug("Copying", :input => path)
-    @logger["method"] = "input"
-    ::Dir.chdir(@attributes[:chdir] || ".") do
-      if @attributes[:prefix]
-        clone(path, File.join(staging_path, @attributes[:prefix]))
+    chdir = attributes[:chdir] || "."
+
+    # Support mapping source=dest
+    # This mapping should work the same way 'rsync -a' does
+    #   Meaning 'rsync -a source dest'
+    #   and 'source=dest' in fpm work the same as the above rsync
+    if path =~ /.=./
+      origin, destination = path.split("=", 2)
+
+      if File.directory?(origin) && origin[-1,1] == "/"
+        chdir = chdir == '.' ? origin : File.join(chdir, origin)
+        source = "."
       else
-        clone(path, staging_path)
+        origin_dir = File.dirname(origin)
+        chdir = chdir == '.' ? origin_dir : File.join(chdir, origin_dir)
+        source = File.basename(origin)
       end
+    else
+      source, destination = path, "/"
+    end
+
+    if attributes[:prefix]
+      destination = File.join(attributes[:prefix], destination)
+    end
+
+    destination = File.join(staging_path, destination)
+
+    @logger["method"] = "input"
+    begin
+      ::Dir.chdir(chdir) do
+        begin
+          clone(source, destination)
+        rescue Errno::ENOENT => e
+          raise FPM::InvalidPackageConfiguration,
+            "Cannot package the path '#{source}', does it exist?"
+        end
+      end
+    rescue Errno::ENOENT => e
+      raise FPM::InvalidPackageConfiguration, 
+        "Cannot chdir to '#{chdir}'. Does it exist?"
     end
 
     # Set some defaults. This is useful because other package types
@@ -74,11 +116,34 @@ class FPM::Package::Dir < FPM::Package
   # The above will copy, recursively, /tmp/hello/world into
   # /tmp/example/hello/world
   def clone(source, destination)
-    # Copy all files from 'path' into staging_path
+    @logger.debug("Cloning path", :source => source, :destination => destination)
+    # Edge case check; abort if the temporary directory is the source.
+    # If the temporary dir is the same path as the source, it causes
+    # fpm to recursively (and forever) copy the staging directory by
+    # accident (#542).
+    if File.expand_path(source) == File.expand_path(::Dir.tmpdir)
+      raise FPM::InvalidPackageConfiguration,
+        "A source directory cannot be the root of your temporary " \
+        "directory (#{::Dir.tmpdir}). fpm uses the temporary directory " \
+        "to stage files during packaging, so this setting would have " \
+        "caused fpm to loop creating staging directories and copying " \
+        "them into your package! Oops! If you are confused, maybe you could " \
+        "check your TMPDIR or TEMPDIR environment variables?"
+    end
 
-    Find.find(source) do |path|
-      target = File.join(destination, path)
-      copy(path, target)
+    # For single file copies, permit file destinations
+    if File.file?(source) && !File.directory?(destination) 
+      if destination[-1,1] == "/"
+        copy(source, File.join(destination, source))
+      else
+        copy(source, destination)
+      end
+    else
+      # Copy all files from 'path' into staging_path
+      Find.find(source) do |path|
+        target = File.join(destination, path)
+        copy(path, target)
+      end
     end
   end # def clone
 
@@ -87,6 +152,7 @@ class FPM::Package::Dir < FPM::Package
   # Files will be hardlinked if possible, but copied otherwise.
   # Symlinks should be copied as symlinks.
   def copy(source, destination)
+    @logger.debug("Copying path", :source => source, :destination => destination)
     directory = File.dirname(destination)
     if !File.directory?(directory)
       FileUtils.mkdir_p(directory)
@@ -112,10 +178,13 @@ class FPM::Package::Dir < FPM::Package
       begin
         @logger.debug("Linking", :source => source, :destination => destination)
         File.link(source, destination)
-      rescue Errno::EXDEV, Errno::EPERM
+      rescue Errno::ENOENT, Errno::EXDEV, Errno::EPERM
         # Hardlink attempt failed, copy it instead
         @logger.debug("Copying", :source => source, :destination => destination)
-        FileUtils.copy_entry(source, destination)
+        copy_entry(source, destination)
+      rescue Errno::EEXIST
+        sane_path = destination.gsub(staging_path, "")
+        @logger.error("Cannot copy file, the destination path is probably a directory and I attempted to write a file.", :path => sane_path, :staging => staging_path)
       end
     end
 

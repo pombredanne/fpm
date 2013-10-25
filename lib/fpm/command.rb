@@ -52,9 +52,11 @@ class FPM::Command < Clamp::Command
     :attribute_name => :chdir
   option "--prefix", "PREFIX",
     "A path to prefix files with when building the target package. This may " \
-    "be necessary for all input packages. For example, the 'gem' type will" \
+    "be necessary for all input packages. For example, the 'gem' type will " \
     "prefix with your gem directory automatically."
   option ["-p", "--package"], "OUTPUT", "The package file path to output."
+  option ["-f", "--force"], :flag, "Force output even if it will overwrite an " \
+    "existing file", :default => false
   option ["-n", "--name"], "NAME", "The name to give to the package"
   option "--verbose", :flag, "Enable verbose output"
   option "--debug", :flag, "Enable debug output"
@@ -75,49 +77,34 @@ class FPM::Command < Clamp::Command
   option ["-d", "--depends"], "DEPENDENCY",
     "A dependency. This flag can be specified multiple times. Value is " \
     "usually in the form of: -d 'name' or -d 'name > version'",
-    :default => [], :attribute_name => :dependencies do |val|
-    # Clamp doesn't support multivalue flags (ie; specifying -d multiple times)
-    # so we can hack around it with this trickery.
-    @dependencies ||= []
-    @dependencies << val
-  end # -d / --depends
+    :multivalued => true, :attribute_name => :dependencies
 
   option "--no-depends", :flag, "Do not list any dependencies in this package",
     :default => false
 
+  option "--no-auto-depends", :flag, "Do not list any dependencies in this" \
+    "package automatically", :default => false
+
   option "--provides", "PROVIDES",
     "What this package provides (usually a name). This flag can be "\
-    "specified multiple times." do |val|
-    @provides ||= []
-    @provides << val
-  end # --provides
+    "specified multiple times.", :multivalued => true,
+    :attribute_name => :provides
   option "--conflicts", "CONFLICTS",
     "Other packages/versions this package conflicts with. This flag can " \
-    "specified multiple times." do |val|
-    @conflicts ||= []
-    @conflicts << val
-  end # --conflicts
+    "specified multiple times.", :multivalued => true,
+    :attribute_name => :conflicts
   option "--replaces", "REPLACES",
     "Other packages/versions this package replaces. This flag can be "\
-    "specified multiple times." do |val|
-    @replaces ||= []
-    @replaces << val
-  end # --replaces
+    "specified multiple times.", :multivalued => true,
+    :attribute_name => :replaces
+
   option "--config-files", "CONFIG_FILES",
     "Mark a file in the package as being a config file. This uses 'conffiles'" \
     " in debs and %config in rpm. If you have multiple files to mark as " \
-    "configuration files, specify this flag multiple times." do |val|
-    #You can specify a directory to have it scanned marking all files found as
-    #config files. If you have multiple "
-    @config_files ||= []
-    @config_files << val
-  end # --config-files
-  option "--directories", "DIRECTORIES",
-    "Mark a directory as being owned by the package" \
-    do |val|
-    @directories ||= []
-    @directories << val
-  end # directories
+    "configuration files, specify this flag multiple times.",
+    :multivalued => true, :attribute_name => :config_files
+  option "--directories", "DIRECTORIES", "Mark a directory as being owned " \
+    "by the package", :multivalued => true, :attribute_name => :directories
   option ["-a", "--architecture"], "ARCHITECTURE",
     "The architecture name. Usually matches 'uname -m'. For automatic values," \
     " you can use '-a all' or '-a native'. These two strings will be " \
@@ -129,12 +116,14 @@ class FPM::Command < Clamp::Command
     "a name suffix to append to package and dependencies."
   option ["-e", "--edit"], :flag,
     "Edit the package spec before building.", :default => false
+
+  excludes = []
   option ["-x", "--exclude"], "EXCLUDE_PATTERN",
     "Exclude paths matching pattern (shell wildcard globs valid here). " \
     "If you have multiple file patterns to exclude, specify this flag " \
     "multiple times.", :attribute_name => :excludes do |val|
-    @excludes ||= []
-    @excludes << val
+    excludes << val
+    next excludes
   end # -x / --exclude
   option "--description", "DESCRIPTION", "Add a description for this package." \
     " You can include '\n' sequences to indicate newline breaks.",
@@ -194,10 +183,10 @@ class FPM::Command < Clamp::Command
 
   option "--template-value", "KEY=VALUE",
     "Make 'key' available in script templates, so <%= key %> given will be " \
-    "the provided value. Implies --template-scripts" do |kv|
+    "the provided value. Implies --template-scripts",
+    :multivalued => true do |kv| 
     @template_scripts = true
-    @template_values ||= []
-    @template_values << kv.split("=", 2)
+    next kv.split("=", 2)
   end
 
   option "--workdir", "WORKDIR",
@@ -215,16 +204,6 @@ class FPM::Command < Clamp::Command
     klass.apply_options(self)
   end
 
-  # TODO(sissel): expose 'option' and 'parameter' junk to FPM::Package and subclasses.
-  # Apply those things to this command.
-  #
-  # Add extra flags from plugins
-  #FPM::Package::Gem.flags(FPM::Flags.new(opts, "gem", "gem only"), @settings)
-  #FPM::Package::Python.flags(FPM::Flags.new(opts, "python", "python only"),
-                            #@settings)
-  #FPM::Package::Deb.flags(FPM::Flags.new(opts, "deb", "deb only"), @settings)
-  #FPM::Package::Rpm.flags(FPM::Flags.new(opts, "rpm", "rpm only"), @settings)
-  
   # A new FPM::Command
   def initialize(*args)
     super(*args)
@@ -234,13 +213,10 @@ class FPM::Command < Clamp::Command
     @dependencies = []
     @config_files = []
     @directories = []
-    @excludes = []
   end # def initialize
 
   # Execute this command. See Clamp::Command#execute and Clamp's documentation
   def execute
-    @logger = Cabin::Channel.get
-    @logger.subscribe(STDOUT)
     @logger.level = :warn
 
     if (stray_flags = args.grep(/^-/); stray_flags.any?)
@@ -364,6 +340,7 @@ class FPM::Command < Clamp::Command
     input.config_files += config_files
     input.directories += directories
     
+    script_errors = []
     setscript = proc do |scriptname|
       # 'self.send(scriptname) == self.before_install == --before-install
       # Gets the path to the script
@@ -373,7 +350,7 @@ class FPM::Command < Clamp::Command
 
       if !File.exists?(path)
         @logger.error("No such file (for #{scriptname.to_s}): #{path.inspect}")
-        return 1
+        script_errors << path
       end
 
       # Load the script into memory.
@@ -384,6 +361,10 @@ class FPM::Command < Clamp::Command
     setscript.call(:after_install)
     setscript.call(:before_remove)
     setscript.call(:after_remove)
+
+    # Bail if any setscript calls had errors. We don't need to log
+    # anything because we've already logged the error(s) above.
+    return 1 if script_errors.any?
 
     # Validate the package
     if input.name.nil? or input.name.empty?
@@ -396,8 +377,8 @@ class FPM::Command < Clamp::Command
     output = input.convert(output_class)
 
     # Provide any template values as methods on the package.
-    if !@template_values.nil?
-      @template_values.each do |key, value|
+    if template_scripts?
+      template_value_list.each do |key, value|
         (class << output; self; end).send(:define_method, key) { value }
       end
     end
@@ -424,10 +405,36 @@ class FPM::Command < Clamp::Command
   rescue FPM::Package::InvalidArgument => e
     @logger.error("Invalid package argument: #{e}")
     return 1
+  rescue FPM::Util::ProcessFailed => e
+    @logger.error("Process failed: #{e}")
+    return 1
   ensure
     input.cleanup unless input.nil?
     output.cleanup unless output.nil?
   end # def execute
+
+  def run(*args)
+    @logger = Cabin::Channel.get
+    @logger.subscribe(STDOUT)
+
+    # fpm initialization files, note the order of the following array is
+    # important, try .fpm in users home directory first and then the current
+    # directory
+    rc_files = [File.join(ENV['HOME'],'.fpm'), '.fpm']
+
+    rc_files.each do |rc_file|
+      if File.readable? rc_file
+        @logger.warn("Loading flags from rc file #{rc_file}")
+        File.readlines(rc_file).each do |line|
+          Shellwords.shellsplit(line).each do |e|
+            ARGV << e
+          end
+        end
+      end
+    end
+
+    super(*args)
+  end # def run
 
   # A simple flag validator
   #
@@ -488,7 +495,7 @@ class FPM::Command < Clamp::Command
         mandatory(@command.input_type == "dir", "--inputs is only valid with -s dir")
       end
 
-      mandatory(@command.args.any? || @command.inputs,
+      mandatory(@command.args.any? || @command.inputs || @command.input_type == 'empty',
                 "No parameters given. You need to pass additional command " \
                 "arguments so that I know what you want to build packages " \
                 "from. For example, for '-s dir' you would pass a list of " \

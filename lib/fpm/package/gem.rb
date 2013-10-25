@@ -1,9 +1,9 @@
 require "fpm/namespace"
 require "fpm/package"
-require "rubygems/package"
 require "rubygems"
 require "fileutils"
 require "fpm/util"
+require "yaml"
 
 # A rubygems package.
 #
@@ -16,8 +16,7 @@ require "fpm/util"
 # * :gem_gem
 class FPM::Package::Gem < FPM::Package
   # Flags '--foo' will be accessable  as attributes[:gem_foo]
-  option "--bin-path", "DIRECTORY", "The directory to install gem executables",
-    :default => ::Gem::bindir
+  option "--bin-path", "DIRECTORY", "The directory to install gem executables"
   option "--package-prefix", "NAMEPREFIX",
     "(DEPRECATED, use --package-name-prefix) Name to prefix the package " \
     "name with." do |value|
@@ -35,6 +34,10 @@ class FPM::Package::Gem < FPM::Package
     :default => true
   option "--fix-dependencies", :flag, "Should the package dependencies be " \
     "prefixed?", :default => true
+  option "--env-shebang", :flag, "Should the target package have the " \
+    "shebang rewritten to use env?", :default => true
+
+  option "--prerelease", :flag, "Allow prerelease versions of a gem", :default => false
 
   def input(gem)
     # 'arg'  is the name of the rubygem we should unpack.
@@ -59,86 +62,81 @@ class FPM::Package::Gem < FPM::Package
   end # def download_if_necessary
 
   def download(gem_name, gem_version=nil)
-    # This code mostly mutated from rubygem's fetch_command.rb
-    # Code use permissible by rubygems's "GPL or these conditions below"
-    # http://rubygems.rubyforge.org/rubygems-update/LICENSE_txt.html
 
     @logger.info("Trying to download", :gem => gem_name, :version => gem_version)
-    dep = ::Gem::Dependency.new(gem_name, gem_version)
 
-    # TODO(sissel): Make a flag to allow prerelease gems?
-    #dep.prerelease = options[:prerelease]
+    gem_fetch = [ "#{attributes[:gem_gem]}", "fetch", gem_name]
 
-    if ::Gem::SpecFetcher.fetcher.respond_to?(:fetch_with_errors)
-      specs_and_sources, errors =
-        ::Gem::SpecFetcher.fetcher.fetch_with_errors(dep, true, true, false)
-    else
-      specs_and_sources =
-        ::Gem::SpecFetcher.fetcher.fetch(dep, true)
-      errors = "???"
-    end
-    spec, source_uri = specs_and_sources.sort_by { |s,| s.version }.last
+    gem_fetch += ["--prerelease"] if attributes[:gem_prerelease?]
+    gem_fetch += ["--version", gem_version] if gem_version
 
-    if spec.nil? then
-      @logger.error("Invalid gem?", :name => gem_name, :version => gem_version, :errors => errors)
-      raise InvalidArgument.new("Invalid gem: #{gem_name}")
+    download_dir = build_path(gem_name)
+    FileUtils.mkdir(download_dir) unless File.directory?(download_dir)
+
+    ::Dir.chdir(download_dir) do |dir|
+      @logger.debug("Downloading in directory #{dir}")
+      safesystem(*gem_fetch)
     end
 
-    path = ::Gem::RemoteFetcher.fetcher.download(spec, source_uri)
-    return path
+    gem_files = ::Dir.glob(File.join(download_dir, "*.gem"))
+
+    if gem_files.length != 1
+      raise "Unexpected number of gem files in #{download_dir},  #{gem_files.length} should be 1"
+    end
+
+    return gem_files.first
   end # def download
 
   def load_package_info(gem_path)
-    file = File.new(gem_path, 'r')
 
-    ::Gem::Package.open(file, 'r') do |gem|
-      spec = gem.metadata
+    spec = YAML.load(%x{#{attributes[:gem_gem]} specification #{gem_path} --yaml})
 
-      if !attributes[:gem_package_prefix].nil?
-        attributes[:gem_package_name_prefix] = attributes[:gem_package_prefix]
-      end
+    if !attributes[:gem_package_prefix].nil?
+      attributes[:gem_package_name_prefix] = attributes[:gem_package_prefix]
+    end
 
-      # name prefixing is optional, if enabled, a name 'foo' will become
-      # 'rubygem-foo' (depending on what the gem_package_name_prefix is)
-      self.name = spec.name
-      if attributes[:gem_fix_name?]
-        self.name = fix_name(spec.name)
-      end
+    # name prefixing is optional, if enabled, a name 'foo' will become
+    # 'rubygem-foo' (depending on what the gem_package_name_prefix is)
+    self.name = spec.name
+    if attributes[:gem_fix_name?]
+      self.name = fix_name(spec.name)
+    end
 
-      #self.name = [attributes[:gem_package_name_prefix], spec.name].join("-")
-      self.license = (spec.license or "no license listed in #{File.basename(file)}")
+    #self.name = [attributes[:gem_package_name_prefix], spec.name].join("-")
+    self.license = (spec.license or "no license listed in #{File.basename(gem_path)}")
 
-      # expand spec's version to match RationalVersioningPolicy to prevent cases
-      # where missing 'build' number prevents correct dependency resolution by target
-      # package manager. Ie. for dpkg 1.1 != 1.1.0
-      m = spec.version.to_s.scan(/(\d+)\.?/)
-      self.version = m.flatten.fill('0', m.length..2).join('.') 
+    # expand spec's version to match RationalVersioningPolicy to prevent cases
+    # where missing 'build' number prevents correct dependency resolution by target
+    # package manager. Ie. for dpkg 1.1 != 1.1.0
+    m = spec.version.to_s.scan(/(\d+)\.?/)
+    self.version = m.flatten.fill('0', m.length..2).join('.') 
 
-      self.vendor = spec.author
-      self.url = spec.homepage
-      self.category = "Languages/Development/Ruby"
+    self.vendor = spec.author
+    self.url = spec.homepage
+    self.category = "Languages/Development/Ruby"
 
-      # if the gemspec has C extensions defined, then this should be a 'native' arch.
-      if !spec.extensions.empty?
-        self.architecture = "native"
-      else
-        self.architecture = "all"
-      end
+    # if the gemspec has C extensions defined, then this should be a 'native' arch.
+    if !spec.extensions.empty?
+      self.architecture = "native"
+    else
+      self.architecture = "all"
+    end
 
-      # make sure we have a description
-      description_options = [ spec.description, spec.summary, "#{spec.name} - no description given" ]
-      self.description = description_options.find { |d| !(d.nil? or d.strip.empty?) }
+    # make sure we have a description
+    description_options = [ spec.description, spec.summary, "#{spec.name} - no description given" ]
+    self.description = description_options.find { |d| !(d.nil? or d.strip.empty?) }
 
-      # Upstream rpms seem to do this, might as well share.
-      # TODO(sissel): Figure out how to hint this only to rpm? 
-      # maybe something like attributes[:rpm_provides] for rpm specific stuff?
-      # Or just ignore it all together.
-      #self.provides << "rubygem(#{self.name})"
+    # Upstream rpms seem to do this, might as well share.
+    # TODO(sissel): Figure out how to hint this only to rpm? 
+    # maybe something like attributes[:rpm_provides] for rpm specific stuff?
+    # Or just ignore it all together.
+    #self.provides << "rubygem(#{self.name})"
 
-      # By default, we'll usually automatically provide this, but in the case that we are
-      # composing multiple packages, it's best to explicitly include it in the provides list.
-      self.provides << "#{self.name} = #{self.version}"
+    # By default, we'll usually automatically provide this, but in the case that we are
+    # composing multiple packages, it's best to explicitly include it in the provides list.
+    self.provides << "#{self.name} = #{self.version}"
 
+    if !attributes[:no_auto_depends?]
       spec.runtime_dependencies.map do |dep|
         # rubygems 1.3.5 doesn't have 'Gem::Dependency#requirement'
         if dep.respond_to?(:requirement)
@@ -149,34 +147,43 @@ class FPM::Package::Gem < FPM::Package
 
         # Some reqs can be ">= a, < b" versions, let's handle that.
         reqs.to_s.split(/, */).each do |req|
-          if attributes[:gem_fix_dependencies?] 
-            name = fix_name(dep.name) 
-          else 
+          if attributes[:gem_fix_dependencies?]
+            name = fix_name(dep.name)
+          else
             name = dep.name
           end
           self.dependencies << "#{name} #{req}"
         end
       end # runtime_dependencies
-    end # ::Gem::Package
+    end #no_auto_depends
   end # def load_package_info
 
   def install_to_staging(gem_path)
     if attributes.include?(:prefix) && ! attributes[:prefix].nil?
       installdir = "#{staging_path}/#{attributes[:prefix]}"
     else
-      installdir = File.join(staging_path, ::Gem::dir)
+      gemdir = safesystemout(*[attributes[:gem_gem], 'env', 'gemdir']).chomp
+      installdir = File.join(staging_path, gemdir)
     end
 
     ::FileUtils.mkdir_p(installdir)
     # TODO(sissel): Allow setting gem tool path
     args = [attributes[:gem_gem], "install", "--quiet", "--no-ri", "--no-rdoc",
-       "--install-dir", installdir, "--ignore-dependencies", "-E"]
-    if attributes[:gem_bin_path]
-      bin_path = File.join(staging_path, attributes[:gem_bin_path])
-      args += ["--bindir", bin_path]
-      ::FileUtils.mkdir_p(bin_path)
+       "--install-dir", installdir, "--ignore-dependencies"]
+    if attributes[:gem_env_shebang?]
+      args += ["-E"]
     end
 
+    if attributes.include?(:gem_bin_path) && ! attributes[:gem_bin_path].nil?
+      bin_path = File.join(staging_path, attributes[:gem_bin_path])
+    else
+      gem_env  = safesystemout(*[attributes[:gem_gem], 'env']).split("\n")
+      gem_bin  = gem_env.select{ |line| line =~ /EXECUTABLE DIRECTORY/ }.first.split(': ').last
+      bin_path = File.join(staging_path, gem_bin)
+    end
+
+    args += ["--bindir", bin_path]
+    ::FileUtils.mkdir_p(bin_path)
     args << gem_path
     safesystem(*args)
   end # def install_to_staging

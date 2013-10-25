@@ -23,10 +23,14 @@ class FPM::Package::RPM < FPM::Package
   } unless defined?(DIGEST_ALGORITHM_MAP)
 
   COMPRESSION_MAP = {
+    "none" => "w0.gzdio",
     "xz" => "w2.xzdio",
     "gzip" => "w9.gzdio",
     "bzip2" => "w9.bzdio"
   } unless defined?(COMPRESSION_MAP)
+
+  option "--use-file-permissions", :flag, 
+      "Use existing file permissions when defining ownership and modes"
 
   option "--user", "USER",
     "Set the user to USER in the %files section.", 
@@ -40,10 +44,23 @@ class FPM::Package::RPM < FPM::Package
       value
   end
 
+  option "--defattrfile", "ATTR",
+    "Set the default file mode (%defattr).",
+    :default => '-' do |value|
+      value
+  end
+
+  option "--defattrdir", "ATTR",
+    "Set the default dir mode (%defattr).",
+    :default => '-' do |value|
+      value
+  end
+
+  rpmbuild_define = []
   option "--rpmbuild-define", "DEFINITION",
     "Pass a --define argument to rpmbuild." do |define|
-    attributes[:rpm_rpmbuild_define] ||= []
-    attributes[:rpm_rpmbuild_define] << define
+    rpmbuild_define << define
+    next rpmbuild_define
   end
 
   option "--digest", DIGEST_ALGORITHM_MAP.keys.join("|"),
@@ -77,7 +94,56 @@ class FPM::Package::RPM < FPM::Package
 
   option "--sign", :flag, "Pass --sign to rpmbuild"
 
+  option "--auto-add-directories", :flag, "Auto add directories not part of filesystem"
+
+  option "--autoreqprov", :flag, "Enable RPM's AutoReqProv option"
+  option "--autoreq", :flag, "Enable RPM's AutoReq option"
+  option "--autoprov", :flag, "Enable RPM's AutoProv option"
+
+  rpmbuild_filter_from_provides = []
+  option "--filter-from-provides", "REGEX",
+    "Set %filter_from_provides to the supplied REGEX." do |filter_from_provides|
+    rpmbuild_filter_from_provides << filter_from_provides
+    next rpmbuild_filter_from_provides
+  end
+  rpmbuild_filter_from_requires = []
+  option "--filter-from-requires", "REGEX",
+    "Set %filter_from_requires to the supplied REGEX." do |filter_from_requires|
+    rpmbuild_filter_from_requires << filter_from_requires
+    next rpmbuild_filter_from_requires
+  end
+
+  option "--ignore-iteration-in-dependencies", :flag,
+            "For '=' (equal) dependencies, allow iterations on the specified " \
+            "version. Default is to be specific. This option allows the same " \
+            "version of a package but any iteration is permitted"
+
   private
+
+  # Fix path name
+  # Replace [ with [\[] to make rpm not use globs
+  # Replace * with [*] to make rpm not use globs
+  # Replace ? with [?] to make rpm not use globs
+  # Replace % with [%] to make rpm not expand macros
+  def rpm_fix_name(name)
+    name = "\"#{name}\"" if name[/\s/]
+    name = name.gsub("[", "[\\[]")
+    name = name.gsub("*", "[*]")
+    name = name.gsub("?", "[?]")
+    name = name.gsub("%", "[%]")
+  end
+
+  def rpm_file_entry(file)
+    file = rpm_fix_name(file)
+    return file unless attributes[:rpm_use_file_permissions?]
+
+    stat = File.stat(file.gsub(/\"/, '').sub(/^\//,''))
+    user = Etc.getpwuid(stat.uid).name
+    group = Etc.getgrgid(stat.gid).name
+    mode = stat.mode
+    return sprintf("%%attr(%o, %s, %s) %s\n", mode & 4095 , user, group, file)
+  end
+
 
   # Handle any architecture naming conversions.
   # For example, debian calls amd64 what redhat calls x86_64, this
@@ -145,17 +211,46 @@ class FPM::Package::RPM < FPM::Package
     end
 
     # Convert != dependency as Conflict =, as rpm doesn't understand !=
-    if origin == FPM::Package::Python
-      self.dependencies = self.dependencies.select do |dep|
-        name, op, version = dep.split(/\s+/)
-        dep_ok = true
-        if op == '!='
-          self.conflicts << "#{name} = #{version}"
-          dep_ok = false
-        end
-        dep_ok
+    self.dependencies = self.dependencies.select do |dep|
+      name, op, version = dep.split(/\s+/)
+      dep_ok = true
+      if op == '!='
+        self.conflicts << "#{name} = #{version}"
+        dep_ok = false
+      end
+      dep_ok
+    end
+
+    # Convert any dashes in version strings to underscores.
+    self.dependencies = self.dependencies.collect do |dep|
+      name, op, version = dep.split(/\s+/)
+      if !version.nil? and version.include?("-")
+        @logger.warn("Dependency package '#{name}' version '#{version}' " \
+                     "includes dashes, converting to underscores")
+        version = version.gsub(/-/, "_")
+        "#{name} #{op} #{version}"
+      else
+        dep
       end
     end
+
+    # if --ignore-iteration-in-dependencies is true convert foo = X, to
+    # foo >= X , foo < X+1
+    if self.attributes[:rpm_ignore_iteration_in_dependencies?]
+      self.dependencies = self.dependencies.collect do |dep|
+        name, op, version = dep.split(/\s+/)
+        if op == '='
+          nextversion = version.split('.').collect { |v| v.to_i }
+          nextversion[-1] += 1
+          nextversion = nextversion.join(".")
+          @logger.warn("Converting dependency #{dep} to #{name} >= #{version}, #{name} < #{nextversion}")
+          ["#{name} >= #{version}", "#{name} < #{nextversion}"]
+        else
+          dep
+        end
+      end.flatten
+    end
+
   end # def converted
 
   def input(path)
@@ -188,9 +283,12 @@ class FPM::Package::RPM < FPM::Package
     #    #{tags[prein]}
     # TODO(sissel): put 'trigger scripts' stuff into attributes
 
-    self.dependencies += rpm.requires.collect do |name, operator, version|
-      [name, operator, version].join(" ")
+    if !attributes[:no_auto_depends?]
+      self.dependencies += rpm.requires.collect do |name, operator, version|
+        [name, operator, version].join(" ")
+      end
     end
+
     self.conflicts += rpm.conflicts.collect do |name, operator, version|
       [name, operator, version].join(" ")
     end
@@ -216,7 +314,6 @@ class FPM::Package::RPM < FPM::Package
 
   def output(output_path)
     output_check(output_path)
-    raise FileAlreadyExists.new(output_path) if File.exists?(output_path)
     %w(BUILD RPMS SRPMS SOURCES SPECS).each { |d| FileUtils.mkdir_p(build_path(d)) }
     args = ["rpmbuild", "-bb"]
 
@@ -235,8 +332,51 @@ class FPM::Package::RPM < FPM::Package
 
     args += ["--sign"] if attributes[:rpm_sign?]
 
+    if attributes[:rpm_auto_add_directories?]
+      fs_dirs_list = File.join(template_dir, "rpm", "filesystem_list")
+      fs_dirs = File.readlines(fs_dirs_list).reject { |x| x =~ /^\s*#/}.map { |x| x.chomp }
+
+      Find.find(staging_path) do |path|
+        next if path == staging_path
+        if File.directory? path and !File.symlink? path
+          add_path = path.gsub(/^#{staging_path}/,'')
+          self.directories << add_path if not fs_dirs.include? add_path
+        end
+      end
+    else
+      self.directories = self.directories.map { |x| File.join(self.prefix, x) }
+      alldirs = []
+      self.directories.each do |path|
+        Find.find(File.join(staging_path, path)) do |subpath|
+          if File.directory? subpath and !File.symlink? subpath
+            alldirs << subpath.gsub(/^#{staging_path}/, '')
+          end
+        end
+      end
+      self.directories = alldirs
+    end
+
+    # scan all conf file paths for files and add them
+    allconfigs = []
+    self.config_files.each do |path|
+      cfg_path = File.expand_path(path, staging_path)
+      Find.find(cfg_path) do |p|
+        allconfigs << p.gsub("#{staging_path}/", '') if File.file? p
+      end
+    end
+    allconfigs.sort!.uniq!
+
+    self.config_files = allconfigs.map { |x| File.join(self.prefix, x) }
+
     (attributes[:rpm_rpmbuild_define] or []).each do |define|
       args += ["--define", define]
+    end
+
+    # copy all files from staging to BUILD dir
+    Find.find(staging_path) do |path|
+      src = path.gsub(/^#{staging_path}/, '')
+      dst = File.join(build_path, build_sub_dir, src)
+      copy_entry(path, dst)
     end
 
     rpmspec = template("rpm.erb").result(binding)
@@ -267,10 +407,26 @@ class FPM::Package::RPM < FPM::Package
     #return File.join("BUILD", prefix)
   end # def prefix
 
-  # The default epoch value must be 1 (backward compatibility for rpms built
-  # with fpm 0.4.3 and older)
+  def version
+    if @version.kind_of?(String) and @version.include?("-")
+      @logger.warn("Package version '#{@version}' includes dashes, converting" \
+                   " to underscores")
+      @version = @version.gsub(/-/, "_")
+    end
+
+    return @version
+  end
+
+  # The default epoch value must be nil, see #381
   def epoch
-    return @epoch || "1"
+    return @epoch if @epoch.is_a?(Numeric)
+
+    if @epoch.nil? or @epoch.empty?
+      @logger.warn("no value for epoch is set, defaulting to nil")
+      return nil
+    end
+
+    return @epoch
   end # def epoch
 
   def to_s(format=nil)
@@ -288,5 +444,5 @@ class FPM::Package::RPM < FPM::Package
 
   public(:input, :output, :converted_from, :architecture, :to_s, :iteration,
          :payload_compression, :digest_algorithm, :prefix, :build_sub_dir,
-         :epoch)
+         :epoch, :version)
 end # class FPM::Package::RPM

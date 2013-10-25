@@ -7,7 +7,11 @@ everyone. So, if you're a maintainer: Thanks for maintaining packages!
 
 ## What is fpm?
 
-It helps you build packages quickly (Packages like RPM and DEB formats).
+It helps you build packages quickly and easily (Packages like RPM and DEB
+formats).
+
+FUNDAMENTAL PRINCIPLE: IF FPM IS NOT HELPING YOU MAKE PACKAGES EASILY, THEN
+THERE IS A BUG IN FPM.
 
 Here is a presentation I gave on fpm at BayLISA: <http://goo.gl/sWs3Z> (I
 included speaker notes you can read, too)
@@ -22,7 +26,7 @@ install, fpm, deploy.
 
 In 60 seconds, starting from nothing, I had both an RPM and a .DEB of memcached
 ready to deploy, and I didn't need to know how to use rpmbuild, rpm specfiles,
-dh_make, debian control files, etc.
+dh\_make, debian control files, etc.
 
 ## Backstory
 
@@ -64,9 +68,24 @@ You can install fpm with gem:
 
     gem install fpm
 
-Running it:
+Building a package named "awesome" might look something like this:
 
-    fpm -s TYPE -t TYPE ...
+    fpm -s <source type> -t <target type> [list of sources]...
+
+"Source type" is what your package is coming from; a directory (dir), a rubygem (gem), an rpm (rpm), a python package (python), a php pear module (pear), etc.
+
+"Target type" is what your output package form should be. Most common are "rpm"
+and "deb" but others exist (solaris, etc)
+
+You have two options for learning to run FPM:
+
+1. If you're impatient, just scan through `fpm --help`; you'll need various
+   options, and they're reasonably straightforward. Impatient learning is
+   totally welcome, and if you run into issues, ask questions in #fpm on
+   freenode irc or on fpm-users@googlegroups.com!
+1. [The wiki](https://github.com/jordansissel/fpm/wiki) has explanations and
+   examples. If you run into problems, I welcome you to ask questions in #fpm
+   on freenode irc or on fpm-users@googlegroups.com!
 
 ## Things that are in the works or should work:
 
@@ -87,6 +106,7 @@ Targets:
 * solaris
 * tar
 * directories
+* Mac OS X `.pkg` files (`osxpkg`)
 
 ## Need Help or Want to Contribute?
 
