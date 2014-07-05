@@ -101,9 +101,10 @@ class FPM::Command < Clamp::Command
   option "--config-files", "CONFIG_FILES",
     "Mark a file in the package as being a config file. This uses 'conffiles'" \
     " in debs and %config in rpm. If you have multiple files to mark as " \
-    "configuration files, specify this flag multiple times.",
+    "configuration files, specify this flag multiple times.  If argument is " \
+    "directory all files inside it will be recursively marked as config files.",
     :multivalued => true, :attribute_name => :config_files
-  option "--directories", "DIRECTORIES", "Mark a directory as being owned " \
+  option "--directories", "DIRECTORIES", "Recursively mark a directory as being owned " \
     "by the package", :multivalued => true, :attribute_name => :directories
   option ["-a", "--architecture"], "ARCHITECTURE",
     "The architecture name. Usually matches 'uname -m'. For automatic values," \
@@ -217,6 +218,12 @@ class FPM::Command < Clamp::Command
 
   # Execute this command. See Clamp::Command#execute and Clamp's documentation
   def execute
+    # Short-circuit if someone simply runs `fpm --version`
+    if ARGV == [ "--version" ]
+      puts FPM::VERSION
+      return 0
+    end
+
     @logger.level = :warn
 
     if (stray_flags = args.grep(/^-/); stray_flags.any?)
@@ -385,8 +392,17 @@ class FPM::Command < Clamp::Command
 
     # Write the output somewhere, package can be nil if no --package is specified, 
     # and that's OK.
+    
+    # If the package output (-p flag) is a directory, write to the default file name
+    # but inside that directory.
+    if ! package.nil? && File.directory?(package)
+      package_file = File.join(package, output.to_s)
+    else
+      package_file = output.to_s(package)
+    end
+
     begin
-      output.output(output.to_s(package))
+      output.output(package_file)
     rescue FPM::Package::FileAlreadyExists => e
       @logger.fatal(e.message)
       return 1
@@ -395,6 +411,7 @@ class FPM::Command < Clamp::Command
       return 1
     end
 
+    @logger.log("Created package", :path => package_file)
     return 0
   rescue FPM::Util::ExecutableNotFound => e
     @logger.error("Need executable '#{e}' to convert #{input_type} to #{output_type}")
@@ -420,14 +437,18 @@ class FPM::Command < Clamp::Command
     # fpm initialization files, note the order of the following array is
     # important, try .fpm in users home directory first and then the current
     # directory
-    rc_files = [File.join(ENV['HOME'],'.fpm'), '.fpm']
+    rc_files = [ ".fpm" ]
+    rc_files << File.join(ENV["HOME"], ".fpm") if ENV["HOME"]
 
     rc_files.each do |rc_file|
       if File.readable? rc_file
         @logger.warn("Loading flags from rc file #{rc_file}")
         File.readlines(rc_file).each do |line|
-          Shellwords.shellsplit(line).each do |e|
-            ARGV << e
+          # reverse becasue 'unshift' pushes onto the left side of the array.
+          Shellwords.shellsplit(line).reverse.each do |arg|
+            # Put '.fpm'-file flags *before* the command line flags
+            # so that we the CLI can override the .fpm flags
+            ARGV.unshift(arg)
           end
         end
       end
