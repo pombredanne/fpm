@@ -60,6 +60,9 @@ class FPM::Command < Clamp::Command
   option ["-n", "--name"], "NAME", "The name to give to the package"
   option "--verbose", :flag, "Enable verbose output"
   option "--debug", :flag, "Enable debug output"
+  option "--debug-workspace", :flag, "Keep any file workspaces around for " \
+    "debugging. This will disable automatic cleanup of package staging and " \
+    "build paths. It will also print which directories are available."
   option ["-v", "--version"], "VERSION", "The version to give to the package",
     :default => 1.0
   option "--iteration", "ITERATION",
@@ -346,6 +349,16 @@ class FPM::Command < Clamp::Command
     input.replaces += replaces
     input.config_files += config_files
     input.directories += directories
+
+    h = {}
+    attrs.each do | e |
+
+      s = e.split(':', 2)
+      h[s.last] = s.first
+    end
+
+    input.attrs = h
+
     
     script_errors = []
     setscript = proc do |scriptname|
@@ -426,8 +439,18 @@ class FPM::Command < Clamp::Command
     @logger.error("Process failed: #{e}")
     return 1
   ensure
-    input.cleanup unless input.nil?
-    output.cleanup unless output.nil?
+    if debug_workspace?
+      # only emit them if they have files
+      [input, output].each do |plugin|
+        [:staging_path, :build_path].each do |pathtype|
+          path = plugin.send(pathtype)
+          puts "#{plugin.type} #{pathtype}: #{path}" if Dir.open(path).to_a.size > 2
+        end
+      end
+    else
+      input.cleanup unless input.nil?
+      output.cleanup unless output.nil?
+    end
   end # def execute
 
   def run(*args)
