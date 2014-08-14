@@ -194,8 +194,8 @@ class FPM::Command < Clamp::Command
   end
 
   option "--workdir", "WORKDIR",
-    "The directory you want fpm to do its work in, where 'work' is any file" \
-    "copying, downloading, etc. Roughly any scratch space fpm needs to build" \
+    "The directory you want fpm to do its work in, where 'work' is any file " \
+    "copying, downloading, etc. Roughly any scratch space fpm needs to build " \
     "your package.", :default => Dir.tmpdir
 
   parameter "[ARGS] ...",
@@ -442,9 +442,11 @@ class FPM::Command < Clamp::Command
     if debug_workspace?
       # only emit them if they have files
       [input, output].each do |plugin|
+        next if plugin.nil?
         [:staging_path, :build_path].each do |pathtype|
           path = plugin.send(pathtype)
-          puts "#{plugin.type} #{pathtype}: #{path}" if Dir.open(path).to_a.size > 2
+          next unless Dir.open(path).to_a.size > 2
+          @logger.log("plugin directory", :plugin => plugin.type, :pathtype => pathtype, :path => path)
         end
       end
     else

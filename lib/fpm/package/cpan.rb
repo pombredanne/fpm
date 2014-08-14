@@ -82,8 +82,14 @@ class FPM::Package::CPAN < FPM::Package
       self.name = fix_name(metadata["name"])
     end
 
-    # Not all things have 'author' listed.
-    self.vendor = metadata["author"].join(", ") unless metadata["author"].nil?
+    # author is not always set or it may be a string instead of an array
+    self.vendor = case metadata["author"]
+      when String; metadata["author"]
+      when Array; metadata["author"].join(", ")
+      else
+        raise FPM::InvalidPackageConfiguration, "Unexpected CPAN 'author' field type: #{metadata["author"].class}. This is a bug."
+    end if metadata.include?("author")
+
     self.url = metadata["resources"]["homepage"] rescue "unknown"
 
     # TODO(sissel): figure out if this perl module compiles anything
